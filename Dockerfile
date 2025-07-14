@@ -3,6 +3,7 @@ FROM python:3.10-slim
 
 # Set working directory
 WORKDIR /app
+ADD . /app
 
 # Copy requirements and bot code
 COPY requirements.txt .
