@@ -17,7 +17,7 @@ logging.basicConfig(filename='runnerlogs.log',
                     level=logging.DEBUG)
 
 dotenv.load_dotenv()
-token = str(os.getenv("token"))
+token = str(os.environ("token"))
 
 bot=telebot.TeleBot(token=token)
 @bot.message_handler(commands=['start'])
