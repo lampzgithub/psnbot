@@ -23,7 +23,12 @@ print(token)
 bot=telebot.TeleBot(token=token)
 @bot.message_handler(commands=['start'])
 def start(message):
-    bot.send_message(message.chat.id, "Hello! I am a bot that can help you with various tasks. Type /help to see what I can do.")
+    bot.send_message(message.chat.id, "Hello! I am a bot that can help you with extracting psn codes. Type /help to know more.")
+@bot.message_handler(commands=['help'])
+def help(message):
+    bot.send_message(message.chat.id, "I can help you extract PSN codes from text, PDF files, or Pastebin links. Use the following commands:\n"
+                     "/w <Pastebin URL> - Fetch content from a Pastebin link\n"
+                     "Send a PDF file - Extract codes from the PDF file\n")
 code_pattern = r'\b[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}\b'
 denom_pattern = r'₹\s?\d{1,4}(?:,\d{3})*(?:\.\d{2})?'
 validity_pattern = r'Expires on (\d{2} \w{3} \d{4})'
