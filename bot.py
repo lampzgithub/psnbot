@@ -124,7 +124,13 @@ def handle_web_paste(message):
         text = response.text
         results = extract_data(text)
         if not results:
-            bot.send_message(message.chat.id, "⚠️ No valid codes found in the Pastebin content.")
+            bot.send_message(message.chat.id, """⚠️ No valid codes found in the Pastebin content. Error fetching paste: {e}\nCopy all gmail content \n
+Go to pastebin.com \n
+create a new paste \n
+After entering details like title etc\n
+Tap on create a new paste \n
+After the paste has been created copy its link \n
+Use /w link in the bot""")
             return
         files = generate_txt_by_denom(results)
         for filename, count in files:
