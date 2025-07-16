@@ -41,17 +41,29 @@ validity_pattern = r'Expires on (\d{2} \w{3} \d{4})'
 
 # Extract code, denomination, validity
 def extract_data(text):
-    codes = re.findall(code_pattern, text)
-    denominations = re.findall(denom_pattern, text)
-    validities = re.findall(validity_pattern, text)
-
-    seen = set()
     results = []
-    for i, code in enumerate(codes):
-        if code not in seen and i < len(denominations) and i < len(validities):
-            seen.add(code)
-            results.append((code.strip(), denominations[i].strip(), validities[i].strip()))
+    seen = set()
+    for match in re.finditer(code_pattern, text):
+        code = match.group()
+        if code in seen:
+            continue
+        seen.add(code)
+
+        # Extract surrounding text (100 characters before & after the code)
+        start = max(0, match.start() - 100)
+        end = min(len(text), match.end() + 100)
+        snippet = text[start:end]
+
+        # Find denomination and validity within this window
+        denom_match = re.search(denom_pattern, snippet)
+        valid_match = re.search(validity_pattern, snippet)
+
+        denom = denom_match.group().strip() if denom_match else "N/A"
+        valid = valid_match.group().strip() if valid_match else "N/A"
+
+        results.append((code, denom, valid))
     return results
+
 
 # Group by denomination and create separate files
 def generate_txt_by_denom(results):
