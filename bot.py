@@ -18,27 +18,28 @@ logging.basicConfig(filename='runnerlogs.log',
 
 # Load .env for token
 dotenv.load_dotenv()
-token = str(os.getenv("tk"))  # make sure your .env has tk=YOUR_TOKEN
+token = str(os.getenv("tk"))  # Ensure .env has tk=YOUR_TELEGRAM_BOT_TOKEN
 bot = telebot.TeleBot(token=token)
 
-# Start and Help Commands
+# Commands
 @bot.message_handler(commands=['start'])
 def start(message):
-    bot.send_message(message.chat.id, "Hello! I am a bot that extracts PSN gift card codes.\nType /help to see what I can do.")
+    bot.send_message(message.chat.id, "👋 Hello! I extract PSN gift card codes.\nUse /help to see how.")
 
 @bot.message_handler(commands=['help'])
 def help(message):
-    bot.send_message(message.chat.id, "I can help you extract PSN codes from:\n"
-                     "- Text (/p <your content>)\n"
-                     "- Pastebin link (/w <link>)\n"
-                     "- PDF file upload\n")
+    bot.send_message(message.chat.id, "📋 *Commands:*\n"
+                                      "`/p <text>` - Paste text to extract\n"
+                                      "`/w <pastebin link>` - Fetch from Pastebin\n"
+                                      "📄 Upload a PDF - I’ll extract from it too!",
+                     parse_mode="Markdown")
 
-# Regex Patterns
+# Regex patterns
 code_pattern = r'\b[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}\b'
 denom_pattern = r'₹\s?\d{1,4}(?:,\d{3})*(?:\.\d{2})?'
 validity_pattern = r'Expires on (\d{2} \w{3} \d{4})'
 
-# Extraction logic
+# Extract code, denomination, validity
 def extract_data(text):
     codes = re.findall(code_pattern, text)
     denominations = re.findall(denom_pattern, text)
@@ -49,49 +50,57 @@ def extract_data(text):
     for i, code in enumerate(codes):
         if code not in seen and i < len(denominations) and i < len(validities):
             seen.add(code)
-            results.append(f"{code},{denominations[i]},{validities[i]}")
+            results.append((code.strip(), denominations[i].strip(), validities[i].strip()))
     return results
 
-# Group and save per denomination
+# Group by denomination and create separate files
 def generate_txt_by_denom(results):
     grouped = defaultdict(list)
-    for row in results:
-        code, denom, valid = row.split(",")
-        grouped[denom.strip()].append(f"{code},{denom},{valid}")
+    for code, denom, valid in results:
+        grouped[denom].append((code, denom, valid))
 
     files = []
-    for denom, rows in grouped.items():
-        clean_denom = denom.replace("₹", "Rs").replace(",", "").replace(".", "")
-        filename = f"output_{clean_denom}.txt"
+    for denom, entries in grouped.items():
+        # Extract numeric value from ₹ 1,000.00 -> 1000
+        number_match = re.search(r'\d+(?:,\d{3})*(?:\.\d{2})?', denom)
+        if number_match:
+            number = number_match.group().replace(",", "").split(".")[0]
+        else:
+            number = "unknown"
+
+        filename = f"output_{number}.txt"
         with open(filename, 'w', encoding='utf-8') as f:
             f.write("CODE,DENOMINATION,VALIDITY\n")
-            f.write("\n".join(rows))
-            f.write(f"\n\nTotal Unique Codes: {len(rows)}")
-        files.append((filename, len(rows)))
+            for code, d, valid in entries:
+                f.write(f"{code},{d},{valid}\n")
+            # f.write(f"\nTotal Unique Codes: {len(entries)}")
+        files.append((filename, len(entries)))
     return files
 
-# /p - handle pasted text
+# /p handler for pasted text
 @bot.message_handler(commands=['p'])
 def handle_pasted_text(message):
-    bot.send_message(message.chat.id, "Processing pasted content...")
+    bot.send_message(message.chat.id, "📋 Processing pasted content...")
     text = message.text.replace("/p", "", 1).strip()
     results = extract_data(text)
 
     if not results:
-        bot.send_message(message.chat.id, "No valid codes found.")
+        bot.send_message(message.chat.id, "⚠️ No valid codes found.")
         return
 
     files = generate_txt_by_denom(results)
     for filename, count in files:
         with open(filename, 'rb') as f:
-            bot.send_document(message.chat.id, f, caption=f"Total Unique Codes: {count}")
+            bot.send_document(message.chat.id, f, caption=f"✅ Total Unique Codes: {count}")
         os.remove(filename)
 
-# /w - handle Pastebin link
+# /w handler for pastebin links
 @bot.message_handler(commands=['w'])
 def handle_web_paste(message):
-    bot.send_message(message.chat.id, "Fetching Pastebin content...")
+    bot.send_message(message.chat.id, "🌐 Fetching Pastebin content...")
     url = message.text.replace("/w", "", 1).strip()
+
+    # Convert normal link to raw if needed
     if "pastebin.com/" in url and "/raw/" not in url:
         paste_id = url.split("/")[-1]
         url = f"https://pastebin.com/raw/{paste_id}"
@@ -103,27 +112,20 @@ def handle_web_paste(message):
         text = response.text
         results = extract_data(text)
         if not results:
-            bot.send_message(message.chat.id, "No valid codes found in the Pastebin content.")
+            bot.send_message(message.chat.id, "⚠️ No valid codes found in the Pastebin content.")
             return
         files = generate_txt_by_denom(results)
         for filename, count in files:
             with open(filename, 'rb') as f:
-                bot.send_document(message.chat.id, f, caption=f"Total Unique Codes: {count}")
+                bot.send_document(message.chat.id, f, caption=f"✅ Total Unique Codes: {count}")
             os.remove(filename)
     except Exception as e:
-        bot.send_message(message.chat.id, f"""Error fetching paste: {e}\n
-                         Copy all gmail content \n
-Go to pastebin.com \n
-create a new paste \n
-After entering details like title etc\n
-Tap on create a new paste \n
-After the paste has been created copy its link \n
-Use /w link in the bot""")
+        bot.send_message(message.chat.id, f"❌ Error fetching paste: {e}")
 
-# Handle PDF file upload
+# PDF file upload handler
 @bot.message_handler(content_types=['document'])
 def handle_pdf_upload(message):
-    bot.send_message(message.chat.id, "Processing PDF file...")
+    bot.send_message(message.chat.id, "📄 Processing PDF file...")
     file_info = bot.get_file(message.document.file_id)
     downloaded_file = bot.download_file(file_info.file_path)
 
@@ -139,17 +141,17 @@ def handle_pdf_upload(message):
     results = extract_data(text)
 
     if not results:
-        bot.send_message(message.chat.id, "No valid codes found in the PDF.")
+        bot.send_message(message.chat.id, "⚠️ No valid codes found in the PDF.")
         os.remove(file_path)
         return
 
     files = generate_txt_by_denom(results)
     for filename, count in files:
         with open(filename, 'rb') as f:
-            bot.send_document(message.chat.id, f, caption=f"Total Unique Codes: {count}")
+            bot.send_document(message.chat.id, f, caption=f"✅ Total Unique Codes: {count}")
         os.remove(filename)
 
     os.remove(file_path)
 
-# Start polling
+# Start the bot
 bot.polling()
