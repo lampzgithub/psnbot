@@ -1,10 +1,12 @@
 import re
 import telebot
 import logging
-import os 
+import os
 import dotenv
-import fitz
+import fitz  # PyMuPDF
 import requests
+import time
+import threading
 from collections import defaultdict
 
 # ✅ Simple logging setup
@@ -16,8 +18,44 @@ dotenv.load_dotenv()
 token = str(os.getenv("tk"))  # Ensure .env has tk=YOUR_TELEGRAM_BOT_TOKEN
 bot = telebot.TeleBot(token=token)
 
+# ✅ Configuration for Temp Files
+TEMP_DIR = "temp_files"
+DELETE_AFTER_SECONDS = 7 * 24 * 60 * 60  # 7 Days
+
+# Ensure temp directory exists
+if not os.path.exists(TEMP_DIR):
+    os.makedirs(TEMP_DIR)
+
 # ✅ Track users who want to store codes
 store_enabled_users = set()
+
+# ------------------ BACKGROUND CLEANUP TASK ------------------ #
+
+def cleanup_old_files():
+    """Checks the temp directory and deletes files older than 7 days."""
+    while True:
+        try:
+            now = time.time()
+            logging.info("🧹 Running cleanup check on temp files...")
+            for filename in os.listdir(TEMP_DIR):
+                file_path = os.path.join(TEMP_DIR, filename)
+                
+                # Check if it's a file and if it's older than the limit
+                if os.path.isfile(file_path):
+                    file_age = now - os.path.getmtime(file_path)
+                    if file_age > DELETE_AFTER_SECONDS:
+                        os.remove(file_path)
+                        logging.info(f"🗑️ Deleted old file: {filename}")
+            
+            # Sleep for 24 hours before next check
+            time.sleep(86400) 
+        except Exception as e:
+            logging.error(f"Error in cleanup thread: {e}")
+            time.sleep(3600) # Retry in an hour if crash
+
+# Start cleanup in a background thread
+cleanup_thread = threading.Thread(target=cleanup_old_files, daemon=True)
+cleanup_thread.start()
 
 # ------------------ COMMANDS ------------------ #
 
@@ -75,10 +113,12 @@ def get_stored_codes(message):
                     results.append(tuple(parts))
 
         files = generate_txt_by_denom(results)
-        for file, count in files:
-            with open(file, 'rb') as f:
-                bot.send_document(message.chat.id, f, caption=f"📄 {file} — {count} codes")
-            os.remove(file)
+        for file_path, count in files:
+            with open(file_path, 'rb') as f:
+                # Extract just the filename for display
+                display_name = os.path.basename(file_path)
+                bot.send_document(message.chat.id, f, caption=f"📄 {display_name} — {count} codes")
+            # ❌ Removed os.remove(file) -> Files are now kept in temp_files
 
     except Exception as e:
         bot.send_message(message.chat.id, f"❌ Error parsing stored file: {e}")
@@ -127,6 +167,8 @@ def generate_txt_by_denom(results):
         grouped[denom].append((code, denom, valid))
 
     files = []
+    timestamp = int(time.time()) # Unique ID to prevent overwriting
+    
     for denom, entries in grouped.items():
         number_match = re.search(r'\d+(?:,\d{3})*(?:\.\d{2})?', denom)
         if number_match:
@@ -134,12 +176,13 @@ def generate_txt_by_denom(results):
         else:
             number = "unknown"
 
-        filename = f"output_{number}.txt"
+        # ✅ Save to TEMP_DIR with timestamp
+        filename = os.path.join(TEMP_DIR, f"output_{number}_{timestamp}.txt")
+        
         with open(filename, 'w', encoding='utf-8') as f:
-            f.write("CODE,DENOMINATION,VALIDITY\n")
             for code, d, valid in entries:
-                f.write(f"{code},{d},{valid}\n")
-            # f.write(f"\nTotal Unique Codes: {len(entries)}")
+                f.write(f"{code}\n")
+        
         files.append((filename, len(entries)))
     return files
 
@@ -182,10 +225,10 @@ def handle_pasted_text(message):
         store_user_codes(message.from_user.id, results)
 
     files = generate_txt_by_denom(results)
-    for filename, count in files:
-        with open(filename, 'rb') as f:
+    for file_path, count in files:
+        with open(file_path, 'rb') as f:
             bot.send_document(message.chat.id, f, caption=f"✅ Total Unique Codes: {count}")
-        os.remove(filename)
+        # ❌ Removed os.remove(file_path)
 
 @bot.message_handler(commands=['w'])
 def handle_web_paste(message):
@@ -205,22 +248,18 @@ def handle_web_paste(message):
 
         if not results:
             bot.send_message(message.chat.id, 
-                             "⚠️ No valid codes found in the Pastebin content.\n\n"
-                             "📋 How to use:\n"
-                             "1. Copy your Gmail content\n"
-                             "2. Go to https://pastebin.com\n"
-                             "3. Paste the content & create the paste\n"
-                             "4. Send the link using /w <link>")
+                             "⚠️ No valid codes found in the Pastebin content.")
             return
 
         if message.from_user.id in store_enabled_users:
             store_user_codes(message.from_user.id, results)
 
         files = generate_txt_by_denom(results)
-        for filename, count in files:
-            with open(filename, 'rb') as f:
+        for file_path, count in files:
+            with open(file_path, 'rb') as f:
                 bot.send_document(message.chat.id, f, caption=f"✅ Total Unique Codes: {count}")
-            os.remove(filename)
+            # ❌ Removed os.remove(file_path)
+            
     except Exception as e:
         bot.send_message(message.chat.id, f"❌ Error fetching paste: {e}")
 
@@ -230,32 +269,38 @@ def handle_pdf_upload(message):
     file_info = bot.get_file(message.document.file_id)
     downloaded_file = bot.download_file(file_info.file_path)
 
-    file_path = message.document.file_name
+    # Save uploaded PDF to temp dir as well to keep root clean
+    file_path = os.path.join(TEMP_DIR, message.document.file_name)
     with open(file_path, 'wb') as f:
         f.write(downloaded_file)
 
     text = ""
-    with fitz.open(file_path) as doc:
-        for page in doc:
-            text += page.get_text()
+    try:
+        with fitz.open(file_path) as doc:
+            for page in doc:
+                text += page.get_text()
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Error reading PDF: {e}")
+        return
 
     results = extract_data(text)
 
+    # Clean up the input PDF immediately (we only want to keep the output text files for 7 days)
+    # If you want to keep the PDF too, remove this line.
+    os.remove(file_path) 
+
     if not results:
         bot.send_message(message.chat.id, "⚠️ No valid codes found in the PDF.")
-        os.remove(file_path)
         return
 
     if message.from_user.id in store_enabled_users:
         store_user_codes(message.from_user.id, results)
 
     files = generate_txt_by_denom(results)
-    for filename, count in files:
-        with open(filename, 'rb') as f:
+    for file_path, count in files:
+        with open(file_path, 'rb') as f:
             bot.send_document(message.chat.id, f, caption=f"✅ Total Unique Codes: {count}")
-        os.remove(filename)
-
-    os.remove(file_path)
+        # ❌ Removed os.remove(file_path)
 
 # ------------------ START BOT ------------------ #
 
