@@ -11,20 +11,18 @@ from collections import defaultdict
 
 # ✅ Simple logging setup
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-logging.info('Starting Bot...')
+logger = logging.getLogger(__name__)
 
 # Load .env for token
 dotenv.load_dotenv()
-token = str(os.getenv("tk"))  # Ensure .env has tk=YOUR_TELEGRAM_BOT_TOKEN
+token = str(os.getenv("tk"))
 bot = telebot.TeleBot(token=token)
 
 # ✅ Configuration for Temp Files
-TEMP_DIR = "temp_files"
+# On Railway, use an absolute path to avoid confusion
+BASE_DIR = os.getcwd()
+TEMP_DIR = os.path.join(BASE_DIR, "temp_files")
 DELETE_AFTER_SECONDS = 7 * 24 * 60 * 60  # 7 Days
-
-# Ensure temp directory exists
-if not os.path.exists(TEMP_DIR):
-    os.makedirs(TEMP_DIR)
 
 # ✅ Track users who want to store codes
 store_enabled_users = set()
@@ -35,23 +33,34 @@ def cleanup_old_files():
     """Checks the temp directory and deletes files older than 7 days."""
     while True:
         try:
+            # 1. Re-create directory if Railway wiped it
+            if not os.path.exists(TEMP_DIR):
+                os.makedirs(TEMP_DIR)
+            
             now = time.time()
-            logging.info("🧹 Running cleanup check on temp files...")
+            # logger.info("🧹 Running cleanup check...") # Uncomment if you want verbose logs
+            
             for filename in os.listdir(TEMP_DIR):
                 file_path = os.path.join(TEMP_DIR, filename)
                 
-                # Check if it's a file and if it's older than the limit
+                # Check if it's a file
                 if os.path.isfile(file_path):
                     file_age = now - os.path.getmtime(file_path)
                     if file_age > DELETE_AFTER_SECONDS:
-                        os.remove(file_path)
-                        logging.info(f"🗑️ Deleted old file: {filename}")
+                        try:
+                            os.remove(file_path)
+                            logger.info(f"🗑️ Deleted old file: {filename}")
+                        except OSError as e:
+                            logger.error(f"Error deleting file {filename}: {e}")
             
-            # Sleep for 24 hours before next check
-            time.sleep(86400) 
+            # Check every 1 hour (3600s) instead of 24 hours
+            # This is safer for cloud environments
+            time.sleep(3600) 
+
         except Exception as e:
-            logging.error(f"Error in cleanup thread: {e}")
-            time.sleep(3600) # Retry in an hour if crash
+            logger.error(f"Error in cleanup thread: {e}")
+            # Wait a bit before retrying to avoid CPU spikes on error loops
+            time.sleep(60)
 
 # Start cleanup in a background thread
 cleanup_thread = threading.Thread(target=cleanup_old_files, daemon=True)
@@ -62,7 +71,7 @@ cleanup_thread.start()
 @bot.message_handler(commands=['start'])
 def start(message):
     user = message.from_user
-    logging.info(f"User started bot: {user.first_name} @{user.username} (ID: {user.id})")
+    logger.info(f"User started bot: {user.first_name} @{user.username} (ID: {user.id})")
     bot.send_message(message.chat.id, "👋 Hello! I extract PSN gift card codes.\nUse /help to see how.")
 
 @bot.message_handler(commands=['help'])
@@ -84,7 +93,7 @@ def toggle_store(message):
         bot.send_message(message.chat.id, "🛑 Code storing disabled.")
     else:
         store_enabled_users.add(user_id)
-        bot.send_message(message.chat.id, "✅ Code storing enabled. All codes you send will be saved.")
+        bot.send_message(message.chat.id, "✅ Code storing enabled (Note: Data clears on bot restart unless Volume attached).")
 
 @bot.message_handler(commands=['getstore'])
 def get_stored_codes(message):
@@ -95,12 +104,10 @@ def get_stored_codes(message):
         bot.send_message(message.chat.id, "📂 You have no stored codes yet.")
         return
 
-    # ✅ First send the full stored file
-    with open(filename, 'rb') as f:
-        bot.send_document(message.chat.id, f, caption="📦 Your stored codes (all)")
-
-    # ✅ Now load and group by denomination
     try:
+        with open(filename, 'rb') as f:
+            bot.send_document(message.chat.id, f, caption="📦 Your stored codes (all)")
+
         with open(filename, 'r', encoding='utf-8') as f:
             lines = f.readlines()[1:]  # Skip header
 
@@ -114,11 +121,10 @@ def get_stored_codes(message):
 
         files = generate_txt_by_denom(results)
         for file_path, count in files:
-            with open(file_path, 'rb') as f:
-                # Extract just the filename for display
-                display_name = os.path.basename(file_path)
-                bot.send_document(message.chat.id, f, caption=f"📄 {display_name} — {count} codes")
-            # ❌ Removed os.remove(file) -> Files are now kept in temp_files
+            if os.path.exists(file_path):
+                with open(file_path, 'rb') as f:
+                    display_name = os.path.basename(file_path)
+                    bot.send_document(message.chat.id, f, caption=f"📄 {display_name} — {count} codes")
 
     except Exception as e:
         bot.send_message(message.chat.id, f"❌ Error parsing stored file: {e}")
@@ -162,12 +168,16 @@ def extract_data(text):
     return results
 
 def generate_txt_by_denom(results):
+    # Ensure temp dir exists before writing
+    if not os.path.exists(TEMP_DIR):
+        os.makedirs(TEMP_DIR)
+
     grouped = defaultdict(list)
     for code, denom, valid in results:
         grouped[denom].append((code, denom, valid))
 
     files = []
-    timestamp = int(time.time()) # Unique ID to prevent overwriting
+    timestamp = int(time.time())
     
     for denom, entries in grouped.items():
         number_match = re.search(r'\d+(?:,\d{3})*(?:\.\d{2})?', denom)
@@ -176,7 +186,6 @@ def generate_txt_by_denom(results):
         else:
             number = "unknown"
 
-        # ✅ Save to TEMP_DIR with timestamp
         filename = os.path.join(TEMP_DIR, f"output_{number}_{timestamp}.txt")
         
         with open(filename, 'w', encoding='utf-8') as f:
@@ -226,9 +235,9 @@ def handle_pasted_text(message):
 
     files = generate_txt_by_denom(results)
     for file_path, count in files:
-        with open(file_path, 'rb') as f:
-            bot.send_document(message.chat.id, f, caption=f"✅ Total Unique Codes: {count}")
-        # ❌ Removed os.remove(file_path)
+        if os.path.exists(file_path):
+            with open(file_path, 'rb') as f:
+                bot.send_document(message.chat.id, f, caption=f"✅ Total Unique Codes: {count}")
 
 @bot.message_handler(commands=['w'])
 def handle_web_paste(message):
@@ -247,8 +256,7 @@ def handle_web_paste(message):
         results = extract_data(text)
 
         if not results:
-            bot.send_message(message.chat.id, 
-                             "⚠️ No valid codes found in the Pastebin content.")
+            bot.send_message(message.chat.id, "⚠️ No valid codes found in the Pastebin content.")
             return
 
         if message.from_user.id in store_enabled_users:
@@ -256,9 +264,9 @@ def handle_web_paste(message):
 
         files = generate_txt_by_denom(results)
         for file_path, count in files:
-            with open(file_path, 'rb') as f:
-                bot.send_document(message.chat.id, f, caption=f"✅ Total Unique Codes: {count}")
-            # ❌ Removed os.remove(file_path)
+            if os.path.exists(file_path):
+                with open(file_path, 'rb') as f:
+                    bot.send_document(message.chat.id, f, caption=f"✅ Total Unique Codes: {count}")
             
     except Exception as e:
         bot.send_message(message.chat.id, f"❌ Error fetching paste: {e}")
@@ -269,7 +277,10 @@ def handle_pdf_upload(message):
     file_info = bot.get_file(message.document.file_id)
     downloaded_file = bot.download_file(file_info.file_path)
 
-    # Save uploaded PDF to temp dir as well to keep root clean
+    # Ensure temp dir exists
+    if not os.path.exists(TEMP_DIR):
+        os.makedirs(TEMP_DIR)
+
     file_path = os.path.join(TEMP_DIR, message.document.file_name)
     with open(file_path, 'wb') as f:
         f.write(downloaded_file)
@@ -285,9 +296,9 @@ def handle_pdf_upload(message):
 
     results = extract_data(text)
 
-    # Clean up the input PDF immediately (we only want to keep the output text files for 7 days)
-    # If you want to keep the PDF too, remove this line.
-    os.remove(file_path) 
+    # Clean up input PDF
+    if os.path.exists(file_path):
+        os.remove(file_path) 
 
     if not results:
         bot.send_message(message.chat.id, "⚠️ No valid codes found in the PDF.")
@@ -298,10 +309,17 @@ def handle_pdf_upload(message):
 
     files = generate_txt_by_denom(results)
     for file_path, count in files:
-        with open(file_path, 'rb') as f:
-            bot.send_document(message.chat.id, f, caption=f"✅ Total Unique Codes: {count}")
-        # ❌ Removed os.remove(file_path)
+        if os.path.exists(file_path):
+            with open(file_path, 'rb') as f:
+                bot.send_document(message.chat.id, f, caption=f"✅ Total Unique Codes: {count}")
 
-# ------------------ START BOT ------------------ #
+# ------------------ START BOT (Infinity Polling) ------------------ #
 
-bot.polling()
+if __name__ == "__main__":
+    logger.info("Bot is running...")
+    while True:
+        try:
+            bot.polling(non_stop=True, interval=0, timeout=20)
+        except Exception as e:
+            logger.error(f"Polling crashed: {e}")
+            time.sleep(5) # Wait before reconnecting
