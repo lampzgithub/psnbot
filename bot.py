@@ -319,8 +319,8 @@ def start_cmd(message):
 
 @bot.message_handler(commands=['help'])
 def help_cmd(message):
-        if is_banned(message.from_user.id):
-            return bot.send_message(message.chat.id, "❌ You are banned from using this bot.")
+    if is_banned(message.from_user.id):
+        return bot.send_message(message.chat.id, "❌ You are banned from using this bot.")
 
     bot.send_message(message.chat.id,
         """📘 *Commands*
@@ -341,8 +341,8 @@ You can send me a PDF too
 
 @bot.message_handler(commands=['getstore'])
 def cmd_getstore(message):
-        if is_banned(message.from_user.id):
-            return bot.send_message(message.chat.id, "❌ You are banned from using this bot.")
+    if is_banned(message.from_user.id):
+        return bot.send_message(message.chat.id, "❌ You are banned from using this bot.")
     uid = message.from_user.id
 
 
@@ -475,8 +475,8 @@ def list_banned(message):
 
 @bot.message_handler(commands=['clearstore'])
 def cmd_clearstore(message):
-        if is_banned(message.from_user.id):
-            return bot.send_message(message.chat.id, "❌ You are banned from using this bot.")
+    if is_banned(message.from_user.id):
+        return bot.send_message(message.chat.id, "❌ You are banned from using this bot.")
 
     uid = message.from_user.id
     filepath = os.path.join(TEMP_DIR, f"stored_{uid}.txt")
@@ -513,8 +513,8 @@ def cmd_clearstore(message):
 
 @bot.message_handler(commands=['remove'])
 def cmd_remove(message):
-        if is_banned(message.from_user.id):
-            return bot.send_message(message.chat.id, "❌ You are banned from using this bot.")
+    if is_banned(message.from_user.id):
+        return bot.send_message(message.chat.id, "❌ You are banned from using this bot.")
 
     uid = message.from_user.id
     filepath = os.path.join(TEMP_DIR, f"stored_{uid}.txt")
@@ -541,8 +541,8 @@ def cmd_remove(message):
 
 @bot.message_handler(commands=['stats'])
 def cmd_stats(message):
-        if is_banned(message.from_user.id):
-            return bot.send_message(message.chat.id, "❌ You are banned from using this bot.")
+    if is_banned(message.from_user.id):
+        return bot.send_message(message.chat.id, "❌ You are banned from using this bot.")
 
     uid = message.from_user.id
     filepath = os.path.join(TEMP_DIR, f"stored_{uid}.txt")
@@ -653,8 +653,8 @@ def cmd_broadcast(message):
 
 @bot.message_handler(func=lambda m: m.content_type == "text" and not m.text.startswith("/"))
 def auto_detect(message):
-        if is_banned(message.from_user.id):
-            return bot.send_message(message.chat.id, "❌ You are banned from using this bot.")
+    if is_banned(message.from_user.id):
+        return bot.send_message(message.chat.id, "❌ You are banned from using this bot.")
 
     uid = message.from_user.id
     text = message.text
@@ -841,8 +841,8 @@ def pdf_handler(message):
 
 @bot.message_handler(commands=['w'])
 def pastebin_extract(message):
-        if is_banned(message.from_user.id):
-            return bot.send_message(message.chat.id, "❌ You are banned from using this bot.")
+    if is_banned(message.from_user.id):
+        return bot.send_message(message.chat.id, "❌ You are banned from using this bot.")
 
     uid = message.from_user.id
     logger.info(f"[PASTEBIN] Request from {uid}: {message.text}")
@@ -894,7 +894,7 @@ def pastebin_extract(message):
 # START BOT POLLING
 # ---------------------------------------------------------
 
-logger.info("🔥 Bot polling started.")
+    logger.info("🔥 Bot polling started.")
 
 while True:
     try:
