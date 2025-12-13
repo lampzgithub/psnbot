@@ -105,6 +105,22 @@ def normalize_code(code: str):
         cleaned = re.sub(r"-", "", code)
         return cleaned[:12]  # normalized long → short form
     return code.replace("-", "")  # normalized short code
+  
+def to_display(code: str):
+    """
+    Convert any code (short or long) into a clean, readable short display form.
+    Long codes → first 12 characters without dashes.
+    Short codes → returned as-is.
+    """
+    code = code.upper().strip()
+
+    # Long format normalization
+    if is_long_code(code):
+        cleaned = re.sub(r"-", "", code)
+        return cleaned[:12]
+
+    # Short format
+    return code.replace("-", "")
 
 
 # ---------------------------------------------------------
@@ -532,3 +548,4 @@ while True:
     except Exception as e:
         logger.error(f"Polling crashed: {e}")
         time.sleep(5)
+
