@@ -68,6 +68,21 @@ else:
     GLOBAL_CODES = {}
 
 logger.debug(f"Loaded global codes registry with {len(GLOBAL_CODES)} entries.")
+# ---------------------------------------------------------
+# BAN LIST (Admin Permanent Bans)
+# ---------------------------------------------------------
+
+BANNED_FILE = os.path.join(TEMP_DIR, "banned.json")
+
+if os.path.exists(BANNED_FILE):
+    with open(BANNED_FILE, "r") as f:
+        BANNED_USERS = set(json.load(f))
+else:
+    BANNED_USERS = set()
+
+def save_bans():
+    with open(BANNED_FILE, "w") as f:
+        json.dump(list(BANNED_USERS), f)
 
 # ---------------------------------------------------------
 # CLEANUP THREAD
@@ -103,6 +118,62 @@ CODE_PATTERNS = [
     re.compile(r"\b[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}\b", re.I),
     re.compile(r"\b[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{12}-[A-Z0-9]{6}\b", re.I),
 ]
+code_pattern = r'\b[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}\b'
+denom_pattern = r'₹\s?\d{1,4}(?:,\d{3})*(?:\.\d{2})?'
+validity_pattern = r'Expires on (\d{2} \w{3} \d{4})'
+
+def extract_data(text):
+    results = []
+    seen = set()
+    for match in re.finditer(code_pattern, text):
+        code = match.group()
+        if code in seen:
+            continue
+
+        seen.add(code)
+
+        start = max(0, match.start() - 100)
+        end = min(len(text), match.end() + 100)
+        snippet = text[start:end]
+
+        denom_match = re.search(denom_pattern, snippet)
+        valid_match = re.search(validity_pattern, snippet)
+
+        denom = denom_match.group().strip() if denom_match else "N/A"
+        valid = valid_match.group().strip() if valid_match else "N/A"
+
+        results.append((code, denom, valid))
+    return results
+
+
+def generate_txt_by_denom(results):
+    os.makedirs(TEMP_DIR, exist_ok=True)
+
+    grouped = defaultdict(list)
+
+    for code, denom, valid in results:
+        grouped[denom].append((code, denom, valid))
+
+    files = []
+    timestamp = int(time.time())
+
+    for denom, entries in grouped.items():
+        number_match = re.search(r'\d+(?:,\d{3})*(?:\.\d{2})?', denom)
+        if number_match:
+            number = number_match.group().replace(",", "").split(".")[0]
+        else:
+            number = "unknown"
+
+        filename = os.path.join(TEMP_DIR, f"output_{number}_{timestamp}.txt")
+
+        with open(filename, "w", encoding="utf-8") as f:
+            for code, d, valid in entries:
+                f.write(f"{code}\n")
+
+        files.append((filename, len(entries)))
+
+    return files
+
 
 def is_long_code(code):
     parts = code.split("-")
@@ -130,6 +201,9 @@ def to_display(code):
 # ---------------------------------------------------------
 # GLOBAL DUPLICATE BLOCKING
 # ---------------------------------------------------------
+def is_banned(uid):
+    return uid in BANNED_USERS
+
 
 def is_duplicate_global(code):
     norm = normalize_code(code)
@@ -230,6 +304,9 @@ def remove_code_from_file(filepath, code):
 
 @bot.message_handler(commands=['start'])
 def start_cmd(message):
+    if is_banned(message.from_user.id):
+        return bot.send_message(message.chat.id, "❌ You are banned from using this bot.")
+
     uid = message.from_user.id
     known_users.add(uid)
     save_users()
@@ -242,6 +319,9 @@ def start_cmd(message):
 
 @bot.message_handler(commands=['help'])
 def help_cmd(message):
+        if is_banned(message.from_user.id):
+            return bot.send_message(message.chat.id, "❌ You are banned from using this bot.")
+
     bot.send_message(
         message.chat.id,
         """📘 *Commands*
@@ -250,7 +330,8 @@ def help_cmd(message):
 /clearstore – Delete your stored codes
 /stats – View your statistics
 /remove <code> – Remove one saved code
-(Everything else works automatically)
+(Everything else works automatically) 
+You can send me a PDF too 
 """,
         parse_mode="Markdown"
     )
@@ -262,6 +343,23 @@ def help_cmd(message):
 
 @bot.message_handler(commands=['getstore'])
 def cmd_getstore(message):
+        if is_banned(message.from_user.id):
+            return bot.send_message(message.chat.id, "❌ You are banned from using this bot.")
+    uid = message.from_user.id
+
+
+
+    logger.info(f"[GETSTORE] User {uid} requested store data.")
+
+# Admin special menu:
+    if is_admin(uid):
+        kb = telebot.types.InlineKeyboardMarkup()
+        kb.add(
+            telebot.types.InlineKeyboardButton("📁 My Codes", callback_data="adm_get_my"),
+            telebot.types.InlineKeyboardButton("🌍 Global Codes", callback_data="adm_get_global")
+        )
+        return bot.send_message(message.chat.id, "Choose which data you want:", reply_markup=kb)
+
     uid = message.from_user.id
     filepath = os.path.join(TEMP_DIR, f"stored_{uid}.txt")
 
@@ -302,6 +400,76 @@ def cmd_getstore(message):
             bot.send_document(message.chat.id, f, caption=f"{denom} — {len(codes)} codes")
             logger.debug(f"[GETSTORE] Sent denom file {out_path} for user {uid}")
 
+@bot.callback_query_handler(func=lambda c: c.data in ["adm_get_my", "adm_get_global"])
+def admin_get_data(call):
+    uid = call.from_user.id
+    if not is_admin(uid):
+        return bot.answer_callback_query(call.id, "Not admin")
+
+    if call.data == "adm_get_my":
+        # mimic user getstore
+        file = os.path.join(TEMP_DIR, f"stored_{uid}.txt")
+        if not os.path.exists(file):
+            return bot.send_message(call.message.chat.id, "You have no stored codes.")
+        with open(file, "rb") as f:
+            bot.send_document(call.message.chat.id, f, caption="📁 Your Codes")
+
+    elif call.data == "adm_get_global":
+        # Generate global file
+        out_path = os.path.join(TEMP_DIR, "GLOBAL_CODES.txt")
+        with open(out_path, "w") as f:
+            for code, owner in GLOBAL_CODES.items():
+                f.write(f"{code} (user {owner})\n")
+
+        with open(out_path, "rb") as f:
+            bot.send_document(call.message.chat.id, f, caption="🌍 Global Codes")
+
+        # also send JSON for advanced admin usage
+        with open(GLOBAL_CODES_FILE, "rb") as f:
+            bot.send_document(call.message.chat.id, f, caption="🌍 Raw Global Registry (JSON)")
+
+
+@bot.message_handler(commands=['unban'])
+def unban_user(message):
+    uid = message.from_user.id
+    if not is_admin(uid):
+        return
+
+    parts = message.text.split(" ", 1)
+    if len(parts) < 2:
+        return bot.send_message(message.chat.id, "Usage: /unban <user_id>")
+
+    try:
+        target = int(parts[1].strip())
+    except:
+        return bot.send_message(message.chat.id, "Invalid user ID.")
+
+    if target in BANNED_USERS:
+        BANNED_USERS.remove(target)
+        save_bans()
+        bot.send_message(message.chat.id, f"✅ User {target} has been unbanned.")
+        logger.info(f"[ADMIN] {uid} unbanned user {target}")
+    else:
+        bot.send_message(message.chat.id, "User is not banned.")
+
+
+@bot.message_handler(commands=['banned'])
+def list_banned(message):
+    uid = message.from_user.id
+    if not is_admin(uid):
+        return
+
+    if not BANNED_USERS:
+        return bot.send_message(message.chat.id, "No users are banned.")
+
+    out = "🚫 *Banned Users:*\n\n"
+    for user in BANNED_USERS:
+        out += f"• {user}\n"
+
+    bot.send_message(message.chat.id, out, parse_mode="Markdown")
+
+
+
 
 # ---------------------------------------------------------
 # COMMAND: /clearstore
@@ -309,6 +477,9 @@ def cmd_getstore(message):
 
 @bot.message_handler(commands=['clearstore'])
 def cmd_clearstore(message):
+        if is_banned(message.from_user.id):
+            return bot.send_message(message.chat.id, "❌ You are banned from using this bot.")
+
     uid = message.from_user.id
     filepath = os.path.join(TEMP_DIR, f"stored_{uid}.txt")
 
@@ -344,6 +515,9 @@ def cmd_clearstore(message):
 
 @bot.message_handler(commands=['remove'])
 def cmd_remove(message):
+        if is_banned(message.from_user.id):
+            return bot.send_message(message.chat.id, "❌ You are banned from using this bot.")
+
     uid = message.from_user.id
     filepath = os.path.join(TEMP_DIR, f"stored_{uid}.txt")
 
@@ -369,6 +543,9 @@ def cmd_remove(message):
 
 @bot.message_handler(commands=['stats'])
 def cmd_stats(message):
+        if is_banned(message.from_user.id):
+            return bot.send_message(message.chat.id, "❌ You are banned from using this bot.")
+
     uid = message.from_user.id
     filepath = os.path.join(TEMP_DIR, f"stored_{uid}.txt")
     logger.info(f"[STATS] User {uid} requested stats.")
@@ -478,6 +655,9 @@ def cmd_broadcast(message):
 
 @bot.message_handler(func=lambda m: m.content_type == "text" and not m.text.startswith("/"))
 def auto_detect(message):
+        if is_banned(message.from_user.id):
+            return bot.send_message(message.chat.id, "❌ You are banned from using this bot.")
+
     uid = message.from_user.id
     text = message.text
 
@@ -555,64 +735,106 @@ def denom_pick(call):
         parse_mode="Markdown"
     )
 
+@bot.message_handler(commands=['ban'])
+def admin_ban(message):
+    uid = message.from_user.id
+    if not is_admin(uid):
+        return
+
+    parts = message.text.split(" ", 1)
+    if len(parts) < 2:
+        return bot.send_message(message.chat.id, "Usage: /ban <user_id>")
+
+    try:
+        target = int(parts[1].strip())
+    except:
+        return bot.send_message(message.chat.id, "Invalid user ID.")
+
+    if target in ADMIN_IDS:
+        return bot.send_message(message.chat.id, "❌ Cannot ban another admin.")
+
+    BANNED_USERS.add(target)
+    save_bans()
+
+    bot.send_message(message.chat.id, f"🚫 User {target} has been banned permanently.")
+    logger.warning(f"[ADMIN] {uid} banned user {target}")
 
 # ---------------------------------------------------------
 # PDF EXTRACTION
 # ---------------------------------------------------------
 
 @bot.message_handler(content_types=['document'])
-def pdf_extract(message):
+def pdf_handler(message):
     uid = message.from_user.id
+
+    if is_banned(uid):
+        return bot.send_message(message.chat.id, "❌ You are banned from using this bot.")
+
     logger.info(f"[PDF] PDF received from {uid}")
 
-    fileinfo = bot.get_file(message.document.file_id)
-    data = bot.download_file(fileinfo.file_path)
+    file_info = bot.get_file(message.document.file_id)
+    downloaded_file = bot.download_file(file_info.file_path)
 
     pdf_path = os.path.join(TEMP_DIR, message.document.file_name)
     with open(pdf_path, "wb") as f:
-        f.write(data)
-    logger.debug(f"[PDF] Saved temp PDF at {pdf_path}")
+        f.write(downloaded_file)
 
     text = ""
     try:
         with fitz.open(pdf_path) as doc:
             for page in doc:
                 text += page.get_text()
-    except:
-        logger.error("[PDF] Invalid PDF file")
-        return bot.send_message(message.chat.id, "❌ Invalid PDF")
+    except Exception as e:
+        logger.error(f"[PDF] Error reading PDF: {e}")
+        return bot.send_message(message.chat.id, "❌ Error reading PDF.")
 
-    found = set()
-    for pat in CODE_PATTERNS:
-        found.update(pat.findall(text.upper()))
+    # --- EXTRACT DATA USING YOUR OLD PARSER ---
+    extracted = extract_data(text)
 
-    logger.info(f"[PDF] Extracted codes: {found}")
+    os.remove(pdf_path)
 
+    if not extracted:
+        return bot.send_message(message.chat.id, "⚠️ No valid codes found in the PDF.")
+
+    logger.info(f"[PDF] Extracted raw results: {extracted}")
+
+    # --- SEPARATE UNIQUE VS DUPLICATE (GLOBAL STRICT MODE) ---
     unique = []
     duplicates = []
 
-    for code in found:
-        if is_duplicate_global(code):
+    for code, denom, valid in extracted:
+        norm = normalize_code(code)
+        if norm in GLOBAL_CODES:
             duplicates.append(code)
         else:
-            unique.append((code, "N/A", "N/A"))
+            unique.append((code, denom, valid))
 
+    # Notify admin/user of duplicates
     if duplicates:
-        bot.send_message(
-            message.chat.id,
-            "⚠ Duplicate codes ignored from PDF:\n" +
-            "\n".join(f"• `{to_display(c)}`" for c in duplicates),
-            parse_mode="Markdown"
-        )
+        dup_msg = "⚠ Duplicate codes ignored:\n" + \
+                  "\n".join(f"• `{to_display(c)}`" for c in duplicates)
+        bot.send_message(message.chat.id, dup_msg, parse_mode="Markdown")
+        logger.info(f"[PDF] Duplicate codes ignored: {duplicates}")
 
-    if unique:
-        store_user_codes(uid, unique)
-        bot.send_message(message.chat.id, f"✔ Saved {len(unique)} new codes.")
-    else:
-        bot.send_message(message.chat.id, "⚠ No new codes found.")
+    # No unique codes
+    if not unique:
+        return bot.send_message(message.chat.id, "⚠ No new codes found to save.")
 
-    os.remove(pdf_path)
-    logger.debug(f"[PDF] Removed temp PDF: {pdf_path}")
+    # Store unique codes PER USER + GLOBAL
+    store_user_codes(uid, unique)
+
+    # Generate TXT files grouped by denomination
+    files = generate_txt_by_denom(unique)
+
+    for file_path, count in files:
+        if os.path.exists(file_path):
+            with open(file_path, "rb") as f:
+                bot.send_document(
+                    message.chat.id,
+                    f,
+                    caption=f"✅ New Unique Codes: {count}"
+                )
+            logger.info(f"[PDF] Sent file: {file_path}")
 
 
 # ---------------------------------------------------------
@@ -621,6 +843,9 @@ def pdf_extract(message):
 
 @bot.message_handler(commands=['w'])
 def pastebin_extract(message):
+        if is_banned(message.from_user.id):
+            return bot.send_message(message.chat.id, "❌ You are banned from using this bot.")
+
     uid = message.from_user.id
     logger.info(f"[PASTEBIN] Request from {uid}: {message.text}")
 
@@ -679,4 +904,5 @@ while True:
     except Exception as e:
         logger.error(f"Polling crashed: {e}")
         time.sleep(5)
+
 
