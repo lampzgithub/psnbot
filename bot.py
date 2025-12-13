@@ -322,8 +322,7 @@ def help_cmd(message):
         if is_banned(message.from_user.id):
             return bot.send_message(message.chat.id, "❌ You are banned from using this bot.")
 
-    bot.send_message(
-        message.chat.id,
+    bot.send_message(message.chat.id,
         """📘 *Commands*
 /w <pastebin> – Extract codes from Pastebin
 /getstore – Download your stored codes
@@ -333,8 +332,7 @@ def help_cmd(message):
 (Everything else works automatically) 
 You can send me a PDF too 
 """,
-        parse_mode="Markdown"
-    )
+        parse_mode="Markdown")
 
 
 # ---------------------------------------------------------
