@@ -11,16 +11,19 @@ import json
 from collections import defaultdict
 
 # ---------------------------------------------------------
-# LOGGING CONFIG (VERBOSE MODE)
+# LOGGING CONFIG (Moderate Verbosity)
 # ---------------------------------------------------------
 
 logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
-    level=logging.DEBUG  # Enable INFO + DEBUG
+    level=logging.INFO   # No debug spam from telebot
 )
 logger = logging.getLogger(__name__)
 
-logger.info("🔵 Bot is starting with VERBOSE logging...")
+telebot_logger = logging.getLogger("telebot")
+telebot_logger.setLevel(logging.WARNING)
+
+logger.info("🔵 Bot is starting...")
 
 # ---------------------------------------------------------
 # LOAD ENV + INIT BOT
@@ -35,14 +38,16 @@ ADMIN_IDS = {int(x) for x in os.getenv("ADMINS", "").split(",") if x.strip().isd
 def is_admin(uid):
     return uid in ADMIN_IDS
 
-logger.debug(f"Loaded admin IDs: {ADMIN_IDS}")
+logger.info(f"Loaded Admins: {ADMIN_IDS}")
 
 # Railway Persistent Path
 TEMP_DIR = "/app/temp_files"
 os.makedirs(TEMP_DIR, exist_ok=True)
-logger.debug(f"Persistent storage path: {TEMP_DIR}")
 
-# Track known users
+# ---------------------------------------------------------
+# USER TRACKING
+# ---------------------------------------------------------
+
 USER_TRACK_FILE = os.path.join(TEMP_DIR, "users.json")
 
 if os.path.exists(USER_TRACK_FILE):
@@ -54,11 +59,11 @@ else:
 def save_users():
     with open(USER_TRACK_FILE, "w") as f:
         json.dump(list(known_users), f)
-    logger.debug("User list saved to disk.")
 
-logger.debug(f"Loaded known users: {known_users}")
+# ---------------------------------------------------------
+# GLOBAL DUPLICATE REGISTRY
+# ---------------------------------------------------------
 
-# Global Duplicate Registry
 GLOBAL_CODES_FILE = os.path.join(TEMP_DIR, "global_codes.json")
 
 if os.path.exists(GLOBAL_CODES_FILE):
@@ -67,9 +72,8 @@ if os.path.exists(GLOBAL_CODES_FILE):
 else:
     GLOBAL_CODES = {}
 
-logger.debug(f"Loaded global codes registry with {len(GLOBAL_CODES)} entries.")
 # ---------------------------------------------------------
-# BAN LIST (Admin Permanent Bans)
+# BAN SYSTEM
 # ---------------------------------------------------------
 
 BANNED_FILE = os.path.join(TEMP_DIR, "banned.json")
@@ -84,25 +88,26 @@ def save_bans():
     with open(BANNED_FILE, "w") as f:
         json.dump(list(BANNED_USERS), f)
 
+def is_banned(uid):
+    return uid in BANNED_USERS
+
 # ---------------------------------------------------------
-# CLEANUP THREAD
+# BACKGROUND CLEANER
 # ---------------------------------------------------------
 
-DELETE_AFTER_SECONDS = 7 * 24 * 60 * 60  # 7 days
+DELETE_AFTER_SECONDS = 7 * 24 * 60 * 60
 pending_user_codes = {}
 
 def cleanup_old_files():
-    logger.info("🧹 Cleanup thread started")
     while True:
         try:
             now = time.time()
             for fname in os.listdir(TEMP_DIR):
                 path = os.path.join(TEMP_DIR, fname)
                 if os.path.isfile(path):
-                    age = now - os.path.getmtime(path)
-                    if age > DELETE_AFTER_SECONDS:
-                        logger.info(f"Deleting old file: {fname}")
+                    if now - os.path.getmtime(path) > DELETE_AFTER_SECONDS:
                         os.remove(path)
+                        logger.info(f"Deleted old file: {fname}")
             time.sleep(3600)
         except Exception as e:
             logger.error(f"Cleanup error: {e}")
@@ -111,13 +116,14 @@ def cleanup_old_files():
 threading.Thread(target=cleanup_old_files, daemon=True).start()
 
 # ---------------------------------------------------------
-# CODE PATTERNS & NORMALIZATION
+# CODE PATTERNS
 # ---------------------------------------------------------
 
 CODE_PATTERNS = [
     re.compile(r"\b[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}\b", re.I),
     re.compile(r"\b[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{12}-[A-Z0-9]{6}\b", re.I),
 ]
+
 code_pattern = r'\b[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}\b'
 denom_pattern = r'₹\s?\d{1,4}(?:,\d{3})*(?:\.\d{2})?'
 validity_pattern = r'Expires on (\d{2} \w{3} \d{4})'
@@ -127,11 +133,11 @@ def extract_data(text):
     seen = set()
     for match in re.finditer(code_pattern, text):
         code = match.group()
+
         if code in seen:
             continue
 
         seen.add(code)
-
         start = max(0, match.start() - 100)
         end = min(len(text), match.end() + 100)
         snippet = text[start:end]
@@ -147,33 +153,28 @@ def extract_data(text):
 
 
 def generate_txt_by_denom(results):
-    os.makedirs(TEMP_DIR, exist_ok=True)
-
     grouped = defaultdict(list)
-
     for code, denom, valid in results:
         grouped[denom].append((code, denom, valid))
 
-    files = []
+    out_files = []
     timestamp = int(time.time())
 
     for denom, entries in grouped.items():
-        number_match = re.search(r'\d+(?:,\d{3})*(?:\.\d{2})?', denom)
-        if number_match:
-            number = number_match.group().replace(",", "").split(".")[0]
-        else:
-            number = "unknown"
+        number_match = re.search(r"\d+(?:,\d{3})*(?:\.\d{2})?", denom)
+        number = number_match.group().replace(",", "").split(".")[0] if number_match else "unknown"
 
-        filename = os.path.join(TEMP_DIR, f"output_{number}_{timestamp}.txt")
-
-        with open(filename, "w", encoding="utf-8") as f:
+        filename = os.path.join(TEMP_DIR, f"{number}_{timestamp}.txt")
+        with open(filename, "w") as f:
             for code, d, valid in entries:
-                f.write(f"{code}\n")
+                f.write(code + "\n")
 
-        files.append((filename, len(entries)))
+        out_files.append((filename, len(entries)))
+    return out_files
 
-    return files
-
+# ---------------------------------------------------------
+# NORMALIZATION & DUPLICATE LOGIC
+# ---------------------------------------------------------
 
 def is_long_code(code):
     parts = code.split("-")
@@ -183,67 +184,42 @@ def normalize_code(code):
     code = code.upper().strip()
     if is_long_code(code):
         cleaned = re.sub(r"-", "", code)
-        short = cleaned[:12]
-        logger.debug(f"Normalized long code {code} → {short}")
-        return short
-    short = code.replace("-", "")
-    logger.debug(f"Normalized short code {code} → {short}")
-    return short
-
-def to_display(code):
-    code = code.upper().strip()
-    if is_long_code(code):
-        cleaned = re.sub(r"-", "", code)
-        disp = cleaned[:12]
-        return disp
+        return cleaned[:12]
     return code.replace("-", "")
 
-# ---------------------------------------------------------
-# GLOBAL DUPLICATE BLOCKING
-# ---------------------------------------------------------
-def is_banned(uid):
-    return uid in BANNED_USERS
-
+def to_display(code):
+    return normalize_code(code)
 
 def is_duplicate_global(code):
-    norm = normalize_code(code)
-    dup = norm in GLOBAL_CODES
-    logger.debug(f"Duplicate check for {norm}: {dup}")
-    return dup
+    return normalize_code(code) in GLOBAL_CODES
 
 def save_to_global_registry(code, uid):
-    norm = normalize_code(code)
-    GLOBAL_CODES[norm] = uid
+    GLOBAL_CODES[normalize_code(code)] = uid
     with open(GLOBAL_CODES_FILE, "w") as f:
         json.dump(GLOBAL_CODES, f)
-    logger.info(f"Global registry updated: {norm} saved for user {uid}")
 
 # ---------------------------------------------------------
-# FILE-BASED STORAGE
+# STORE USER CODES
 # ---------------------------------------------------------
 
 def store_user_codes(uid, code_tuples):
     filepath = os.path.join(TEMP_DIR, f"stored_{uid}.txt")
-    logger.info(f"Storing {len(code_tuples)} codes for user {uid}")
 
     existing = set()
     if os.path.exists(filepath):
         with open(filepath, "r") as f:
+            next(f, None)
             for line in f:
-                if "," in line and not line.startswith("CODE,"):
-                    existing.add(line.strip())
+                existing.add(line.strip())
 
     new_lines = []
-
     for code, denom, valid in code_tuples:
         norm = normalize_code(code)
         if norm in GLOBAL_CODES:
-            logger.warning(f"Duplicate blocked globally: {code}")
             continue
 
         entry = f"{code},{denom},{valid}"
         if entry not in existing:
-            logger.debug(f"Adding new user code: {entry}")
             new_lines.append(entry)
             save_to_global_registry(code, uid)
 
@@ -254,30 +230,232 @@ def store_user_codes(uid, code_tuples):
                 f.write("CODE,DENOMINATION,VALIDITY\n")
             for line in new_lines:
                 f.write(line + "\n")
-        logger.info(f"Saved {len(new_lines)} new codes for user {uid}")
-    else:
-        logger.info("No new codes to save (all duplicates).")
 
-def count_codes(filepath):
+# ---------------------------------------------------------
+# BOT COMMANDS
+# ---------------------------------------------------------
+
+@bot.message_handler(commands=['start'])
+def start(message):
+    uid = message.from_user.id
+    if is_banned(uid):
+        return bot.send_message(message.chat.id, "❌ You are banned from using this bot.")
+
+    known_users.add(uid)
+    save_users()
+
+    bot.send_message(message.chat.id, "👋 Welcome! Send PSN codes or use /help")
+
+
+@bot.message_handler(commands=['help'])
+def help_cmd(message):
+    if is_banned(message.from_user.id):
+        return bot.send_message(message.chat.id, "❌ You are banned from using this bot.")
+
+    bot.send_message(message.chat.id,
+                     """📘 *Commands*
+/w <pastebin> – Extract codes from Pastebin
+/getstore – Download denomination-sorted TXT files
+/clearstore – Delete your stored codes
+/stats – View your stats
+/remove <code> – Remove a saved code
+You can also upload a PDF.
+""", parse_mode="Markdown")
+
+# ---------------------------------------------------------
+# /getstore (User + Admin My Codes)
+# ---------------------------------------------------------
+
+@bot.message_handler(commands=['getstore'])
+def cmd_getstore(message):
+    uid = message.from_user.id
+
+    if is_banned(uid):
+        return bot.send_message(message.chat.id, "❌ You are banned from using this bot.")
+
+    # Admin special menu
+    if is_admin(uid):
+        kb = telebot.types.InlineKeyboardMarkup()
+        kb.add(
+            telebot.types.InlineKeyboardButton("📁 My Codes", callback_data="adm_get_my"),
+            telebot.types.InlineKeyboardButton("🌍 Global Codes", callback_data="adm_get_global")
+        )
+        return bot.send_message(message.chat.id, "Choose an option:", reply_markup=kb)
+
+    # User normal mode
+    return send_user_codes(uid, message.chat.id)
+
+
+def send_user_codes(uid, chat_id):
+    filepath = os.path.join(TEMP_DIR, f"stored_{uid}.txt")
+
     if not os.path.exists(filepath):
-        return {}
-    stats = defaultdict(int)
-    with open(filepath) as f:
+        return bot.send_message(chat_id, "📂 You have no stored codes.")
+
+    results = []
+    with open(filepath, "r") as f:
         next(f)
         for line in f:
             parts = line.strip().split(",")
             if len(parts) == 3:
-                stats[parts[1]] += 1
-    logger.debug(f"Counted stats: {stats}")
-    return stats
+                results.append(parts)
 
-def remove_code_from_file(filepath, code):
-    if not os.path.exists(filepath):
-        return False
+    grouped = defaultdict(list)
+    for code, denom, valid in results:
+        grouped[denom].append(code)
 
+    timestamp = int(time.time())
+
+    for denom, codes in grouped.items():
+        number_match = re.search(r"\d+(?:,\d{3})*", denom)
+        number = number_match.group() if number_match else "unknown"
+
+        out_path = os.path.join(TEMP_DIR, f"{number}_{uid}_{timestamp}.txt")
+
+        with open(out_path, "w") as f:
+            for c in codes:
+                f.write(c + "\n")
+
+        with open(out_path, "rb") as f:
+            bot.send_document(chat_id, f, caption=f"{denom} — {len(codes)} codes")
+
+# ---------------------------------------------------------
+# ADMIN GETSTORE OPTIONS
+# ---------------------------------------------------------
+
+@bot.callback_query_handler(func=lambda c: c.data in ["adm_get_my", "adm_get_global"])
+def admin_get(call):
+    uid = call.from_user.id
+    if not is_admin(uid):
+        return bot.answer_callback_query(call.id, "Not admin")
+
+    if call.data == "adm_get_my":
+        return send_user_codes(uid, call.message.chat.id)
+
+    if call.data == "adm_get_global":
+        return send_global_codes(call.message.chat.id)
+
+
+def send_global_codes(chat_id):
+    grouped = defaultdict(list)
+
+    for uid in known_users:
+        filepath = os.path.join(TEMP_DIR, f"stored_{uid}.txt")
+        if not os.path.exists(filepath):
+            continue
+
+        with open(filepath, "r") as f:
+            next(f)
+            for line in f:
+                parts = line.strip().split(",")
+                if len(parts) == 3:
+                    code, denom, valid = parts
+                    norm = normalize_code(code)
+                    if norm in GLOBAL_CODES:
+                        grouped[denom].append(code)
+
+    timestamp = int(time.time())
+
+    for denom, codes in grouped.items():
+        number_match = re.search(r"\d+(?:,\d{3})*", denom)
+        number = number_match.group() if number_match else "unknown"
+
+        out_path = os.path.join(TEMP_DIR, f"global_{number}_{timestamp}.txt")
+        with open(out_path, "w") as f:
+            for c in codes:
+                f.write(c + "\n")
+
+        with open(out_path, "rb") as f:
+            bot.send_document(chat_id, f, caption=f"🌍 {denom} — {len(codes)} global codes")
+
+    with open(GLOBAL_CODES_FILE, "rb") as f:
+        bot.send_document(chat_id, f, caption="🌍 Raw Global Registry (JSON)")
+
+# ---------------------------------------------------------
+# BAN / UNBAN / LIST BANNED
+# ---------------------------------------------------------
+
+@bot.message_handler(commands=['ban'])
+def ban_cmd(message):
+    if not is_admin(message.from_user.id):
+        return
+
+    parts = message.text.split(" ", 1)
+    if len(parts) < 2:
+        return bot.send_message(message.chat.id, "Usage: /ban <id>")
+
+    try:
+        target = int(parts[1])
+    except:
+        return bot.send_message(message.chat.id, "Invalid ID.")
+
+    if target in ADMIN_IDS:
+        return bot.send_message(message.chat.id, "❌ Cannot ban an admin.")
+
+    BANNED_USERS.add(target)
+    save_bans()
+
+    bot.send_message(message.chat.id, f"🚫 User {target} banned permanently.")
+
+
+@bot.message_handler(commands=['unban'])
+def unban_cmd(message):
+    if not is_admin(message.from_user.id):
+        return
+
+    parts = message.text.split(" ", 1)
+    if len(parts) < 2:
+        return bot.send_message(message.chat.id, "Usage: /unban <id>")
+
+    try:
+        target = int(parts[1])
+    except:
+        return bot.send_message(message.chat.id, "Invalid ID.")
+
+    if target in BANNED_USERS:
+        BANNED_USERS.remove(target)
+        save_bans()
+        return bot.send_message(message.chat.id, f"✅ User {target} unbanned.")
+
+    bot.send_message(message.chat.id, "User was not banned.")
+
+
+@bot.message_handler(commands=['banned'])
+def banned_list(message):
+    if not is_admin(message.from_user.id):
+        return
+
+    if not BANNED_USERS:
+        return bot.send_message(message.chat.id, "No banned users.")
+
+    out = "🚫 *Banned Users:*\n\n"
+    for u in BANNED_USERS:
+        out += f"• {u}\n"
+
+    bot.send_message(message.chat.id, out, parse_mode="Markdown")
+
+# ---------------------------------------------------------
+# REMOVE CODE
+# ---------------------------------------------------------
+
+@bot.message_handler(commands=['remove'])
+def remove_cmd(message):
+    uid = message.from_user.id
+    if is_banned(uid):
+        return bot.send_message(message.chat.id, "❌ You are banned.")
+
+    parts = message.text.split(" ", 1)
+    if len(parts) < 2:
+        return bot.send_message(message.chat.id, "Usage: /remove <code>")
+
+    code = parts[1]
     norm = normalize_code(code)
+
+    filepath = os.path.join(TEMP_DIR, f"stored_{uid}.txt")
+    if not os.path.exists(filepath):
+        return bot.send_message(message.chat.id, "You have no codes stored.")
+
     removed = False
-    logger.debug(f"Attempting to remove {norm} from {filepath}")
 
     with open(filepath, "r") as f:
         lines = f.readlines()
@@ -286,308 +464,92 @@ def remove_code_from_file(filepath, code):
         for line in lines:
             if norm in normalize_code(line) and not removed:
                 removed = True
-                logger.info(f"Removed code {norm} from user file")
                 continue
             f.write(line)
 
-    if removed and norm in GLOBAL_CODES:
-        del GLOBAL_CODES[norm]
+    if removed:
+        GLOBAL_CODES.pop(norm, None)
         with open(GLOBAL_CODES_FILE, "w") as f:
             json.dump(GLOBAL_CODES, f)
-        logger.info(f"Removed {norm} from global registry")
+        return bot.send_message(message.chat.id, "✔ Code removed.")
 
-    return removed
-
-# ---------------------------------------------------------
-# COMMAND: /start
-# ---------------------------------------------------------
-
-@bot.message_handler(commands=['start'])
-def start_cmd(message):
-    if is_banned(message.from_user.id):
-        return bot.send_message(message.chat.id, "❌ You are banned from using this bot.")
-
-    uid = message.from_user.id
-    known_users.add(uid)
-    save_users()
-    logger.info(f"User {uid} started the bot.")
-    bot.send_message(message.chat.id, "👋 Welcome! Send PSN codes or use /help")
+    bot.send_message(message.chat.id, "❌ Code not found.")
 
 # ---------------------------------------------------------
-# COMMAND: /help
-# ---------------------------------------------------------
-
-@bot.message_handler(commands=['help'])
-def help_cmd(message):
-    if is_banned(message.from_user.id):
-        return bot.send_message(message.chat.id, "❌ You are banned from using this bot.")
-
-    bot.send_message(message.chat.id,
-        """📘 *Commands*
-/w <pastebin> – Extract codes from Pastebin
-/getstore – Download your stored codes
-/clearstore – Delete your stored codes
-/stats – View your statistics
-/remove <code> – Remove one saved code
-(Everything else works automatically) 
-You can send me a PDF too 
-""",
-        parse_mode="Markdown")
-
-
-# ---------------------------------------------------------
-# COMMAND: /getstore (User’s Own Data Only)
-# ---------------------------------------------------------
-
-@bot.message_handler(commands=['getstore'])
-def cmd_getstore(message):
-    if is_banned(message.from_user.id):
-        return bot.send_message(message.chat.id, "❌ You are banned from using this bot.")
-    uid = message.from_user.id
-
-
-
-    logger.info(f"[GETSTORE] User {uid} requested store data.")
-
-# Admin special menu:
-    if is_admin(uid):
-        kb = telebot.types.InlineKeyboardMarkup()
-        kb.add(
-            telebot.types.InlineKeyboardButton("📁 My Codes", callback_data="adm_get_my"),
-            telebot.types.InlineKeyboardButton("🌍 Global Codes", callback_data="adm_get_global")
-        )
-        return bot.send_message(message.chat.id, "Choose which data you want:", reply_markup=kb)
-
-    uid = message.from_user.id
-    filepath = os.path.join(TEMP_DIR, f"stored_{uid}.txt")
-
-    logger.info(f"[GETSTORE] User {uid} requested their stored codes.")
-
-    if not os.path.exists(filepath):
-        bot.send_message(message.chat.id, "📂 You have no stored codes.")
-        return
-
-    # Send full raw file
-    with open(filepath, "rb") as f:
-        bot.send_document(message.chat.id, f, caption="📦 Your stored codes (FULL FILE)")
-        logger.debug(f"[GETSTORE] Sent raw stored file for user {uid}")
-
-    # Prepare denom-separated output files
-    results = []
-    with open(filepath, "r") as f:
-        next(f)  # skip header
-        for line in f:
-            parts = line.strip().split(",")
-            if len(parts) == 3:
-                results.append(tuple(parts))
-
-    files = defaultdict(list)
-    for code, denom, valid in results:
-        files[denom].append(code)
-
-    # Create TXT files for each denomination
-    for denom, codes in files.items():
-        normalized = re.sub(r"\D", "", denom) or "unknown"
-        out_path = os.path.join(TEMP_DIR, f"output_{normalized}_{uid}.txt")
-
-        with open(out_path, "w") as f:
-            for code in codes:
-                f.write(code + "\n")
-
-        with open(out_path, "rb") as f:
-            bot.send_document(message.chat.id, f, caption=f"{denom} — {len(codes)} codes")
-            logger.debug(f"[GETSTORE] Sent denom file {out_path} for user {uid}")
-
-@bot.callback_query_handler(func=lambda c: c.data in ["adm_get_my", "adm_get_global"])
-def admin_get_data(call):
-    uid = call.from_user.id
-    if not is_admin(uid):
-        return bot.answer_callback_query(call.id, "Not admin")
-
-    if call.data == "adm_get_my":
-        # mimic user getstore
-        file = os.path.join(TEMP_DIR, f"stored_{uid}.txt")
-        if not os.path.exists(file):
-            return bot.send_message(call.message.chat.id, "You have no stored codes.")
-        with open(file, "rb") as f:
-            bot.send_document(call.message.chat.id, f, caption="📁 Your Codes")
-
-    elif call.data == "adm_get_global":
-        # Generate global file
-        out_path = os.path.join(TEMP_DIR, "GLOBAL_CODES.txt")
-        with open(out_path, "w") as f:
-            for code, owner in GLOBAL_CODES.items():
-                f.write(f"{code} (user {owner})\n")
-
-        with open(out_path, "rb") as f:
-            bot.send_document(call.message.chat.id, f, caption="🌍 Global Codes")
-
-        # also send JSON for advanced admin usage
-        with open(GLOBAL_CODES_FILE, "rb") as f:
-            bot.send_document(call.message.chat.id, f, caption="🌍 Raw Global Registry (JSON)")
-
-
-@bot.message_handler(commands=['unban'])
-def unban_user(message):
-    uid = message.from_user.id
-    if not is_admin(uid):
-        return
-
-    parts = message.text.split(" ", 1)
-    if len(parts) < 2:
-        return bot.send_message(message.chat.id, "Usage: /unban <user_id>")
-
-    try:
-        target = int(parts[1].strip())
-    except:
-        return bot.send_message(message.chat.id, "Invalid user ID.")
-
-    if target in BANNED_USERS:
-        BANNED_USERS.remove(target)
-        save_bans()
-        bot.send_message(message.chat.id, f"✅ User {target} has been unbanned.")
-        logger.info(f"[ADMIN] {uid} unbanned user {target}")
-    else:
-        bot.send_message(message.chat.id, "User is not banned.")
-
-
-@bot.message_handler(commands=['banned'])
-def list_banned(message):
-    uid = message.from_user.id
-    if not is_admin(uid):
-        return
-
-    if not BANNED_USERS:
-        return bot.send_message(message.chat.id, "No users are banned.")
-
-    out = "🚫 *Banned Users:*\n\n"
-    for user in BANNED_USERS:
-        out += f"• {user}\n"
-
-    bot.send_message(message.chat.id, out, parse_mode="Markdown")
-
-
-
-
-# ---------------------------------------------------------
-# COMMAND: /clearstore
+# CLEAR STORE
 # ---------------------------------------------------------
 
 @bot.message_handler(commands=['clearstore'])
-def cmd_clearstore(message):
-    if is_banned(message.from_user.id):
-        return bot.send_message(message.chat.id, "❌ You are banned from using this bot.")
-
+def clearstore_cmd(message):
     uid = message.from_user.id
+
+    if is_banned(uid):
+        return bot.send_message(message.chat.id, "❌ You are banned.")
+
     filepath = os.path.join(TEMP_DIR, f"stored_{uid}.txt")
 
-    logger.info(f"[CLEARSTORE] User {uid} requested deletion of stored codes.")
-
     if os.path.exists(filepath):
-        # Remove user-specific codes from GLOBAL registry
-        try:
-            with open(filepath, "r") as f:
-                next(f)
-                for line in f:
-                    code = line.split(",")[0]
-                    norm = normalize_code(code)
-                    if norm in GLOBAL_CODES:
-                        del GLOBAL_CODES[norm]
-        except:
-            pass
+        # Remove from global registry
+        with open(filepath, "r") as f:
+            next(f)
+            for line in f:
+                code = line.split(",")[0]
+                GLOBAL_CODES.pop(normalize_code(code), None)
 
         with open(GLOBAL_CODES_FILE, "w") as f:
             json.dump(GLOBAL_CODES, f)
 
         os.remove(filepath)
-        bot.send_message(message.chat.id, "🗑 Your stored codes were deleted.")
-        logger.info(f"[CLEARSTORE] User {uid} code file deleted.")
+        return bot.send_message(message.chat.id, "🗑 All your codes deleted.")
 
-    else:
-        bot.send_message(message.chat.id, "📂 You have no stored codes.")
-
+    bot.send_message(message.chat.id, "You have no stored codes.")
 
 # ---------------------------------------------------------
-# COMMAND: /remove <code>
-# ---------------------------------------------------------
-
-@bot.message_handler(commands=['remove'])
-def cmd_remove(message):
-    if is_banned(message.from_user.id):
-        return bot.send_message(message.chat.id, "❌ You are banned from using this bot.")
-
-    uid = message.from_user.id
-    filepath = os.path.join(TEMP_DIR, f"stored_{uid}.txt")
-
-    parts = message.text.split(" ", 1)
-    if len(parts) < 2:
-        return bot.send_message(message.chat.id, "Usage: /remove <code>")
-
-    code = parts[1].strip()
-
-    logger.info(f"[REMOVE] User {uid} attempting to remove code {code}")
-
-    if remove_code_from_file(filepath, code):
-        bot.send_message(message.chat.id, "✔ Code removed.")
-        logger.info(f"[REMOVE] Code {code} removed for user {uid}")
-    else:
-        bot.send_message(message.chat.id, "❌ Code not found.")
-        logger.warning(f"[REMOVE] Code {code} not found for user {uid}")
-
-
-# ---------------------------------------------------------
-# COMMAND: /stats
+# STATS
 # ---------------------------------------------------------
 
 @bot.message_handler(commands=['stats'])
-def cmd_stats(message):
-    if is_banned(message.from_user.id):
-        return bot.send_message(message.chat.id, "❌ You are banned from using this bot.")
-
+def stats_cmd(message):
     uid = message.from_user.id
+    if is_banned(uid):
+        return bot.send_message(message.chat.id, "❌ You are banned.")
+
     filepath = os.path.join(TEMP_DIR, f"stored_{uid}.txt")
-    logger.info(f"[STATS] User {uid} requested stats.")
+    if not os.path.exists(filepath):
+        return bot.send_message(message.chat.id, "📊 No stored codes.")
 
-    stats = count_codes(filepath)
+    stats = defaultdict(int)
 
-    if not stats:
-        return bot.send_message(message.chat.id, "📊 You have no stored codes.")
+    with open(filepath, "r") as f:
+        next(f)
+        for line in f:
+            parts = line.strip().split(",")
+            stats[parts[1]] += 1
 
-    total = sum(stats.values())
-    out = "📊 *Your Stats:*\n\n"
-
+    msg = "📊 *Your Stats:*\n\n"
     for denom, count in stats.items():
-        out += f"{denom}: **{count}** codes\n"
+        msg += f"{denom}: **{count}**\n"
 
-    out += f"\nTotal codes saved: **{total}**"
+    msg += f"\nTotal: **{sum(stats.values())}**"
 
-    bot.send_message(message.chat.id, out, parse_mode="Markdown")
-
+    bot.send_message(message.chat.id, msg, parse_mode="Markdown")
 
 # ---------------------------------------------------------
-# ADMIN PANEL (Hidden)
+# ADMIN PANEL
 # ---------------------------------------------------------
 
 @bot.message_handler(commands=['admin'])
 def admin_cmd(message):
-    uid = message.from_user.id
-    if not is_admin(uid):
-        logger.warning(f"⚠ Unauthorized admin attempt by {uid}")
+    if not is_admin(message.from_user.id):
         return
-
-    logger.info(f"[ADMIN] Admin {uid} opened panel.")
 
     kb = telebot.types.InlineKeyboardMarkup()
     kb.add(
         telebot.types.InlineKeyboardButton("👥 Users Count", callback_data="adm_users"),
         telebot.types.InlineKeyboardButton("🔢 Total Codes", callback_data="adm_codes")
     )
-    kb.add(
-        telebot.types.InlineKeyboardButton("🗑 Wipe All", callback_data="adm_wipe")
-    )
-    kb.add(
-        telebot.types.InlineKeyboardButton("📢 Broadcast", callback_data="adm_broadcast")
-    )
+    kb.add(telebot.types.InlineKeyboardButton("🗑 Wipe All", callback_data="adm_wipe"))
+    kb.add(telebot.types.InlineKeyboardButton("📢 Broadcast", callback_data="adm_broadcast"))
 
     bot.send_message(message.chat.id, "🛠 *Admin Panel*", reply_markup=kb, parse_mode="Markdown")
 
@@ -598,78 +560,63 @@ def admin_handler(call):
     if not is_admin(uid):
         return bot.answer_callback_query(call.id, "Not admin")
 
-    action = call.data
-    logger.info(f"[ADMIN ACTION] {uid} triggered: {action}")
+    if call.data == "adm_users":
+        bot.send_message(call.message.chat.id, f"👥 Users: {len(known_users)}")
 
-    if action == "adm_users":
-        bot.send_message(call.message.chat.id, f"👥 Total users: {len(known_users)}")
+    elif call.data == "adm_codes":
+        bot.send_message(call.message.chat.id, f"🔢 Global Unique Codes: {len(GLOBAL_CODES)}")
 
-    elif action == "adm_codes":
-        bot.send_message(call.message.chat.id, f"🔢 Total unique global codes: {len(GLOBAL_CODES)}")
-
-    elif action == "adm_wipe":
-        logger.warning("⚠ ADMIN WIPED ALL DATA!")
+    elif call.data == "adm_wipe":
         for fname in os.listdir(TEMP_DIR):
             if fname.startswith("stored_"):
                 os.remove(os.path.join(TEMP_DIR, fname))
-
         GLOBAL_CODES.clear()
         with open(GLOBAL_CODES_FILE, "w") as f:
             json.dump(GLOBAL_CODES, f)
+        bot.send_message(call.message.chat.id, "🗑 Wiped all user code data.")
 
-        bot.send_message(call.message.chat.id, "🗑 All user data wiped.")
-
-    elif action == "adm_broadcast":
-        bot.send_message(call.message.chat.id, "Send broadcast with:\n/broadcast <message>")
+    elif call.data == "adm_broadcast":
+        bot.send_message(call.message.chat.id, "Use:\n/broadcast <message>")
 
 
 @bot.message_handler(commands=['broadcast'])
-def cmd_broadcast(message):
-    uid = message.from_user.id
-    if not is_admin(uid):
+def broadcast(message):
+    if not is_admin(message.from_user.id):
         return
 
     msg = message.text.replace("/broadcast", "", 1).strip()
-
     if not msg:
-        return bot.send_message(message.chat.id, "Usage: /broadcast <message>")
-
-    logger.info(f"[BROADCAST] Admin {uid} broadcasting: {msg}")
+        return bot.send_message(message.chat.id, "Usage: /broadcast <msg>")
 
     sent = 0
-    for user in known_users:
+    for u in known_users:
         try:
-            bot.send_message(user, f"📢 *Broadcast:*\n{msg}", parse_mode="Markdown")
+            bot.send_message(u, f"📢 *Broadcast:*\n{msg}", parse_mode="Markdown")
             sent += 1
         except:
             pass
 
     bot.send_message(message.chat.id, f"Sent to {sent} users.")
 
-
 # ---------------------------------------------------------
-# AUTO-DETECT CODES IN NORMAL MESSAGES
+# AUTO-DETECT TEXT PSN CODE
 # ---------------------------------------------------------
 
 @bot.message_handler(func=lambda m: m.content_type == "text" and not m.text.startswith("/"))
 def auto_detect(message):
-    if is_banned(message.from_user.id):
-        return bot.send_message(message.chat.id, "❌ You are banned from using this bot.")
-
     uid = message.from_user.id
+
+    if is_banned(uid):
+        return bot.send_message(message.chat.id, "❌ You are banned.")
+
     text = message.text
-
-    logger.info(f"[DETECT] Received message from {uid}: {text[:50]}...")
-
     found = set()
+
     for pat in CODE_PATTERNS:
-        found.update(pat.findall(text.upper()))
+        found |= set(pat.findall(text.upper()))
 
     if not found:
-        logger.debug("[DETECT] No codes found.")
         return
-
-    logger.info(f"[DETECT] Found codes: {found}")
 
     unique = []
     duplicates = []
@@ -681,190 +628,126 @@ def auto_detect(message):
             unique.append(code)
 
     if duplicates:
-        bot.send_message(
-            message.chat.id,
-            "⚠ Already saved (ignored):\n" + "\n".join(f"• `{to_display(c)}`" for c in duplicates),
-            parse_mode="Markdown"
-        )
-        logger.info(f"[DETECT] Duplicates ignored: {duplicates}")
+        bot.send_message(message.chat.id,
+                         "⚠ Already saved:\n" +
+                         "\n".join(f"• `{to_display(c)}`" for c in duplicates),
+                         parse_mode="Markdown")
 
     if not unique:
         return
 
     pending_user_codes[uid] = unique
-    logger.debug(f"[PENDING] User {uid} pending codes: {unique}")
 
     kb = telebot.types.InlineKeyboardMarkup()
-    for amt in ["₹1000", "₹2000", "₹3000", "₹4000", "₹5000"]:
-        kb.add(telebot.types.InlineKeyboardButton(amt, callback_data=f"denom_{amt}"))
+    for d in ["₹1000", "₹2000", "₹3000", "₹4000", "₹5000"]:
+        kb.add(telebot.types.InlineKeyboardButton(d, callback_data=f"denom_{d}"))
 
-    display = "\n".join(f"• `{to_display(c)}`" for c in unique)
-
-    bot.send_message(
-        message.chat.id,
-        f"🎉 *New PSN Codes Detected!*\n\n{display}\n\nChoose denomination:",
-        parse_mode="Markdown",
-        reply_markup=kb
-    )
-
+    bot.send_message(message.chat.id,
+                     "🎉 *New Codes Found!*\nChoose denomination:",
+                     parse_mode="Markdown",
+                     reply_markup=kb)
 
 # ---------------------------------------------------------
 # DENOMINATION SELECTION
 # ---------------------------------------------------------
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("denom_"))
-def denom_pick(call):
+def denom_callback(call):
     uid = call.from_user.id
-    denom = call.data.replace("denom_", "")
-
-    logger.info(f"[DENOM] User {uid} chose denomination: {denom}")
 
     if uid not in pending_user_codes:
-        logger.warning(f"[DENOM] No pending codes for {uid}")
         return bot.answer_callback_query(call.id, "No pending codes.")
 
+    denom = call.data.replace("denom_", "")
     codes = pending_user_codes.pop(uid)
-    store_user_codes(uid, [(code, denom, "N/A") for code in codes])
 
-    bot.edit_message_text(
-        f"✔ Saved {len(codes)} codes under *{denom}*.",
-        call.message.chat.id,
-        call.message.message_id,
-        parse_mode="Markdown"
-    )
+    store_user_codes(uid, [(c, denom, "N/A") for c in codes])
 
-@bot.message_handler(commands=['ban'])
-def admin_ban(message):
-    uid = message.from_user.id
-    if not is_admin(uid):
-        return
-
-    parts = message.text.split(" ", 1)
-    if len(parts) < 2:
-        return bot.send_message(message.chat.id, "Usage: /ban <user_id>")
-
-    try:
-        target = int(parts[1].strip())
-    except:
-        return bot.send_message(message.chat.id, "Invalid user ID.")
-
-    if target in ADMIN_IDS:
-        return bot.send_message(message.chat.id, "❌ Cannot ban another admin.")
-
-    BANNED_USERS.add(target)
-    save_bans()
-
-    bot.send_message(message.chat.id, f"🚫 User {target} has been banned permanently.")
-    logger.warning(f"[ADMIN] {uid} banned user {target}")
+    bot.edit_message_text(f"✔ Saved {len(codes)} codes under {denom}.",
+                          call.message.chat.id,
+                          call.message.message_id)
 
 # ---------------------------------------------------------
-# PDF EXTRACTION
+# PDF IMPORT
 # ---------------------------------------------------------
 
 @bot.message_handler(content_types=['document'])
 def pdf_handler(message):
     uid = message.from_user.id
-
     if is_banned(uid):
-        return bot.send_message(message.chat.id, "❌ You are banned from using this bot.")
+        return bot.send_message(message.chat.id, "❌ You are banned.")
 
-    logger.info(f"[PDF] PDF received from {uid}")
-
-    file_info = bot.get_file(message.document.file_id)
-    downloaded_file = bot.download_file(file_info.file_path)
+    fileinfo = bot.get_file(message.document.file_id)
+    data = bot.download_file(fileinfo.file_path)
 
     pdf_path = os.path.join(TEMP_DIR, message.document.file_name)
     with open(pdf_path, "wb") as f:
-        f.write(downloaded_file)
+        f.write(data)
 
     text = ""
     try:
         with fitz.open(pdf_path) as doc:
-            for page in doc:
-                text += page.get_text()
-    except Exception as e:
-        logger.error(f"[PDF] Error reading PDF: {e}")
-        return bot.send_message(message.chat.id, "❌ Error reading PDF.")
-
-    # --- EXTRACT DATA USING YOUR OLD PARSER ---
-    extracted = extract_data(text)
+            for p in doc:
+                text += p.get_text()
+    except:
+        return bot.send_message(message.chat.id, "❌ Invalid PDF.")
 
     os.remove(pdf_path)
 
+    extracted = extract_data(text)
     if not extracted:
-        return bot.send_message(message.chat.id, "⚠️ No valid codes found in the PDF.")
+        return bot.send_message(message.chat.id, "⚠ No PSN codes found.")
 
-    logger.info(f"[PDF] Extracted raw results: {extracted}")
-
-    # --- SEPARATE UNIQUE VS DUPLICATE (GLOBAL STRICT MODE) ---
     unique = []
     duplicates = []
 
     for code, denom, valid in extracted:
-        norm = normalize_code(code)
-        if norm in GLOBAL_CODES:
+        if is_duplicate_global(code):
             duplicates.append(code)
         else:
             unique.append((code, denom, valid))
 
-    # Notify admin/user of duplicates
     if duplicates:
-        dup_msg = "⚠ Duplicate codes ignored:\n" + \
-                  "\n".join(f"• `{to_display(c)}`" for c in duplicates)
-        bot.send_message(message.chat.id, dup_msg, parse_mode="Markdown")
-        logger.info(f"[PDF] Duplicate codes ignored: {duplicates}")
+        bot.send_message(message.chat.id,
+                         "⚠ Duplicate codes ignored:\n" +
+                         "\n".join(f"`{to_display(c)}`" for c in duplicates),
+                         parse_mode="Markdown")
 
-    # No unique codes
     if not unique:
-        return bot.send_message(message.chat.id, "⚠ No new codes found to save.")
+        return bot.send_message(message.chat.id, "⚠ No new unique codes found.")
 
-    # Store unique codes PER USER + GLOBAL
     store_user_codes(uid, unique)
 
-    # Generate TXT files grouped by denomination
+    # produce denom-based txt files
     files = generate_txt_by_denom(unique)
 
     for file_path, count in files:
-        if os.path.exists(file_path):
-            with open(file_path, "rb") as f:
-                bot.send_document(
-                    message.chat.id,
-                    f,
-                    caption=f"✅ New Unique Codes: {count}"
-                )
-            logger.info(f"[PDF] Sent file: {file_path}")
-
+        with open(file_path, "rb") as f:
+            bot.send_document(message.chat.id, f, caption=f"Saved: {count} new codes")
 
 # ---------------------------------------------------------
-# /w – Pastebin Code Extraction
+# PASTEBIN
 # ---------------------------------------------------------
 
 @bot.message_handler(commands=['w'])
-def pastebin_extract(message):
-    if is_banned(message.from_user.id):
-        return bot.send_message(message.chat.id, "❌ You are banned from using this bot.")
-
+def pastebin_cmd(message):
     uid = message.from_user.id
-    logger.info(f"[PASTEBIN] Request from {uid}: {message.text}")
+    if is_banned(uid):
+        return bot.send_message(message.chat.id, "❌ You are banned.")
 
     url = message.text.replace("/w", "", 1).strip()
 
     if "pastebin.com" in url and "/raw/" not in url:
-        paste = url.split("/")[-1]
-        url = f"https://pastebin.com/raw/{paste}"
+        url = f"https://pastebin.com/raw/{url.split('/')[-1]}"
 
     try:
         text = requests.get(url).text
-        logger.debug("[PASTEBIN] Content fetched successfully.")
     except:
-        logger.error("[PASTEBIN] Fetch failed.")
-        return bot.send_message(message.chat.id, "❌ Error fetching Pastebin link.")
+        return bot.send_message(message.chat.id, "❌ Error loading Pastebin.")
 
     found = set()
     for pat in CODE_PATTERNS:
-        found.update(pat.findall(text.upper()))
-
-    logger.info(f"[PASTEBIN] Extracted codes: {found}")
+        found |= set(pat.findall(text.upper()))
 
     unique = []
     duplicates = []
@@ -876,12 +759,10 @@ def pastebin_extract(message):
             unique.append((code, "N/A", "N/A"))
 
     if duplicates:
-        bot.send_message(
-            message.chat.id,
-            "⚠ Already saved (ignored):\n" +
-            "\n".join(f"• `{to_display(c)}`" for c in duplicates),
-            parse_mode="Markdown"
-        )
+        bot.send_message(message.chat.id,
+                         "⚠ Already saved:\n" +
+                         "\n".join(f"`{to_display(c)}`" for c in duplicates),
+                         parse_mode="Markdown")
 
     if unique:
         store_user_codes(uid, unique)
@@ -889,18 +770,15 @@ def pastebin_extract(message):
     else:
         bot.send_message(message.chat.id, "⚠ No new codes found.")
 
-
 # ---------------------------------------------------------
-# START BOT POLLING
+# START BOT
 # ---------------------------------------------------------
 
-    logger.info("🔥 Bot polling started.")
+logger.info("🔥 Polling started...")
 
 while True:
     try:
-        bot.polling(non_stop=True, interval=0, timeout=20)
+        bot.polling(non_stop=True, timeout=30)
     except Exception as e:
         logger.error(f"Polling crashed: {e}")
         time.sleep(5)
-
-
