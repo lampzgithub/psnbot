@@ -101,6 +101,8 @@ def is_banned(uid):
 
 DELETE_AFTER_SECONDS = 7 * 24 * 60 * 60  # 7 days
 pending_user_codes = {}  # uid → list of codes requiring manual denomination
+pending_parse_review = {}  # uid -> pending parse payload for confirm/edit flow
+admin_browse_state = {}  # admin_uid -> pagination state
 
 def cleanup_old_files():
     while True:
@@ -250,6 +252,178 @@ def store_user_codes(uid, code_tuples):
                 f.write("CODE,DENOMINATION,VALIDITY\n")
             for line in new_lines:
                 f.write(line + "\n")
+
+def detect_codes_with_positions(text):
+    """
+    Returns sorted list of tuples: (code, start_index, end_index)
+    preserving appearance order and removing duplicates by normalized code.
+    """
+    candidates = []
+    for pat in CODE_PATTERNS:
+        for m in pat.finditer(text.upper()):
+            candidates.append((m.group(0), m.start(), m.end()))
+
+    candidates.sort(key=lambda x: x[1])
+
+    unique = []
+    seen = set()
+    for code, start, end in candidates:
+        norm = normalize_code(code)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        unique.append((code, start, end))
+
+    return unique
+
+
+def detect_denom_from_snippet(snippet):
+    m = re.search(r"₹\s?(\d{4,5})", snippet)
+    if m:
+        return m.group(1)
+
+    m = re.search(r"\b(1000|2000|3000|4000|5000)\b", snippet)
+    if m:
+        return m.group(1)
+
+    m = re.search(r"\b([1-5])k\b", snippet, re.I)
+    if m:
+        return str(int(m.group(1)) * 1000)
+
+    return None
+
+
+def parse_code_entries_from_text(text):
+    """
+    Parse all code entries from free text while preserving order.
+    Each entry includes a best-effort denomination detection from local snippet.
+    """
+    entries = []
+    for code, start, end in detect_codes_with_positions(text):
+        snippet_start = max(0, start - 80)
+        snippet_end = min(len(text), end + 80)
+        snippet = text[snippet_start:snippet_end]
+        denom = detect_denom_from_snippet(snippet)
+        entries.append({"code": code, "denom": denom, "status": "pending"})
+    return entries
+
+
+def render_parse_review_text(entries, title="🧾 *Review parsed codes*"):
+    lines = [title, ""]
+    for idx, item in enumerate(entries, start=1):
+        denom = f"₹{item['denom']}" if item.get("denom") else "❓"
+        lines.append(f"{idx}. `{to_display(item['code'])}` — {denom}")
+    lines.append("\nChoose *Confirm* to save or *Edit* to fix.")
+    return "\n".join(lines)
+
+
+def parse_edited_lines(raw_text):
+    """Expected format per line: CODE 1k|2k|... OR CODE 1000|2000|..."""
+    cleaned = raw_text.strip()
+    if not cleaned:
+        return None, "Empty input."
+
+    result = []
+    for line in cleaned.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+
+        code_match = None
+        for pat in CODE_PATTERNS:
+            code_match = pat.search(line.upper())
+            if code_match:
+                break
+
+        if not code_match:
+            return None, f"Couldn't find a code in line: {line}"
+
+        code = code_match.group(0)
+        denom = detect_denom_from_snippet(line)
+        result.append({"code": code, "denom": denom, "status": "pending"})
+
+    if not result:
+        return None, "No valid lines found."
+
+    return result, None
+
+
+def delete_user_store(uid):
+    """Delete only one user's stored file and detach its global ownership entries."""
+    filepath = os.path.join(TEMP_DIR, f"stored_{uid}.txt")
+    if not os.path.exists(filepath):
+        return 0
+
+    removed_count = 0
+    with open(filepath, "r") as f:
+        next(f, None)
+        for line in f:
+            code = line.split(",")[0].strip()
+            norm = normalize_code(code)
+            if GLOBAL_CODES.get(norm) == uid:
+                GLOBAL_CODES.pop(norm, None)
+            removed_count += 1
+
+    with open(GLOBAL_CODES_FILE, "w") as f:
+        json.dump(GLOBAL_CODES, f)
+
+    os.remove(filepath)
+    return removed_count
+
+
+def get_user_code_count(uid):
+    filepath = os.path.join(TEMP_DIR, f"stored_{uid}.txt")
+    if not os.path.exists(filepath):
+        return 0
+    with open(filepath, "r") as f:
+        next(f, None)
+        return sum(1 for _ in f)
+
+
+def build_admin_dashboard_text(page=0, per_page=8):
+    users = sorted(known_users)
+    total_users = len(users)
+    total_codes = len(GLOBAL_CODES)
+    start = page * per_page
+    subset = users[start:start + per_page]
+
+    lines = [
+        "🛠 *Admin Dashboard*",
+        f"👥 Users: *{total_users}*",
+        f"🔢 Global unique codes: *{total_codes}*",
+        "",
+        "Select a user to manage codes:"
+    ]
+
+    for u in subset:
+        lines.append(f"• `{u}` — {get_user_code_count(u)} codes")
+
+    if not subset:
+        lines.append("(No users found on this page)")
+
+    return "\n".join(lines)
+
+
+def build_admin_dashboard_kb(page=0, per_page=8):
+    kb = telebot.types.InlineKeyboardMarkup()
+    users = sorted(known_users)
+    start = page * per_page
+    subset = users[start:start + per_page]
+
+    for uid in subset:
+        kb.add(telebot.types.InlineKeyboardButton(f"👤 {uid}", callback_data=f"adm_user_{uid}"))
+
+    nav = []
+    if page > 0:
+        nav.append(telebot.types.InlineKeyboardButton("⬅️ Prev", callback_data=f"adm_dash_{page - 1}"))
+    if start + per_page < len(users):
+        nav.append(telebot.types.InlineKeyboardButton("Next ➡️", callback_data=f"adm_dash_{page + 1}"))
+    if nav:
+        kb.row(*nav)
+
+    kb.add(telebot.types.InlineKeyboardButton("🔄 Refresh", callback_data=f"adm_dash_{page}"))
+    return kb
+
 
 # ---------------------------------------------------------
 # START COMMAND
@@ -524,27 +698,9 @@ def clearstore_cmd(message):
     if is_banned(uid):
         return bot.send_message(message.chat.id, "❌ You are banned.")
 
-    filepath = os.path.join(TEMP_DIR, f"stored_{uid}.txt")
-
-    if os.path.exists(filepath):
-        # Remove from global registry
-        try:
-            with open(filepath, "r") as f:
-                next(f, None)
-                for line in f:
-                    code = line.split(",")[0]
-                    norm = normalize_code(code)
-                    if norm in GLOBAL_CODES:
-                        GLOBAL_CODES.pop(norm, None)
-        except:
-            pass
-
-        with open(GLOBAL_CODES_FILE, "w") as f:
-            json.dump(GLOBAL_CODES, f)
-
-        os.remove(filepath)
-        return bot.send_message(message.chat.id, "🗑 Your stored codes were deleted.")
-
+    removed = delete_user_store(uid)
+    if removed:
+        return bot.send_message(message.chat.id, f"🗑 Your stored codes were deleted ({removed} removed).")
     return bot.send_message(message.chat.id, "📂 You have no stored codes.")
 
 
@@ -595,23 +751,14 @@ def admin_cmd(message):
     if not is_admin(uid):
         return
 
-    kb = telebot.types.InlineKeyboardMarkup()
-
-    kb.add(
-        telebot.types.InlineKeyboardButton("👥 Users Count", callback_data="adm_users"),
-        telebot.types.InlineKeyboardButton("🔢 Total Codes", callback_data="adm_codes")
+    page = 0
+    admin_browse_state[uid] = page
+    bot.send_message(
+        message.chat.id,
+        build_admin_dashboard_text(page=page),
+        reply_markup=build_admin_dashboard_kb(page=page),
+        parse_mode="Markdown"
     )
-    kb.add(
-        telebot.types.InlineKeyboardButton("🗑 Wipe All User Data", callback_data="adm_wipe")
-    )
-    kb.add(
-        telebot.types.InlineKeyboardButton("📢 Broadcast", callback_data="adm_broadcast")
-    )
-
-    bot.send_message(message.chat.id,
-                     "🛠 *Admin Panel*",
-                     reply_markup=kb,
-                     parse_mode="Markdown")
 
 
 # ---------------------------------------------------------
@@ -627,39 +774,61 @@ def admin_panel_handler(call):
 
     action = call.data
 
-    # 🧮 Total User Count
     if action == "adm_users":
-        return bot.send_message(
-            call.message.chat.id,
-            f"👥 Total users: {len(known_users)}"
-        )
+        return bot.send_message(call.message.chat.id, f"👥 Total users: {len(known_users)}")
 
-    # 🔢 Total global unique codes
     if action == "adm_codes":
-        return bot.send_message(
+        return bot.send_message(call.message.chat.id, f"🔢 Total unique global codes: {len(GLOBAL_CODES)}")
+
+    if action.startswith("adm_dash_"):
+        try:
+            page = int(action.split("_")[-1])
+        except ValueError:
+            page = 0
+        admin_browse_state[uid] = max(0, page)
+        return bot.edit_message_text(
+            build_admin_dashboard_text(page=admin_browse_state[uid]),
             call.message.chat.id,
-            f"🔢 Total unique global codes: {len(GLOBAL_CODES)}"
+            call.message.message_id,
+            parse_mode="Markdown",
+            reply_markup=build_admin_dashboard_kb(page=admin_browse_state[uid])
         )
 
-    # 🗑 Wipe All User Data
-    if action == "adm_wipe":
-        # delete all stored_ files
-        for fname in os.listdir(TEMP_DIR):
-            if fname.startswith("stored_"):
-                os.remove(os.path.join(TEMP_DIR, fname))
+    if action.startswith("adm_user_") and action.count("_") == 2:
+        target_uid = int(action.split("_")[-1])
+        count = get_user_code_count(target_uid)
+        kb = telebot.types.InlineKeyboardMarkup()
+        kb.add(telebot.types.InlineKeyboardButton("📁 Download store", callback_data=f"adm_user_get_{target_uid}"))
+        kb.add(telebot.types.InlineKeyboardButton("🗑 Clear this user only", callback_data=f"adm_user_clear_{target_uid}"))
+        kb.add(telebot.types.InlineKeyboardButton("⬅️ Back", callback_data=f"adm_dash_{admin_browse_state.get(uid, 0)}"))
+        return bot.edit_message_text(
+            f"👤 *User:* `{target_uid}`\n📦 *Codes:* {count}\n\nChoose an action:",
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
 
-        GLOBAL_CODES.clear()
-        with open(GLOBAL_CODES_FILE, "w") as f:
-            json.dump(GLOBAL_CODES, f)
+    if action.startswith("adm_user_get_"):
+        target_uid = int(action.split("_")[-1])
+        send_user_codes(target_uid, call.message.chat.id)
+        return bot.answer_callback_query(call.id, "Store sent")
 
-        return bot.send_message(call.message.chat.id, "🗑 All user code data wiped.")
+    if action.startswith("adm_user_clear_"):
+        target_uid = int(action.split("_")[-1])
+        removed = delete_user_store(target_uid)
+        kb = telebot.types.InlineKeyboardMarkup()
+        kb.add(telebot.types.InlineKeyboardButton("⬅️ Back to dashboard", callback_data=f"adm_dash_{admin_browse_state.get(uid, 0)}"))
+        return bot.edit_message_text(
+            f"🗑 Cleared user `{target_uid}` only. Removed {removed} codes.",
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
 
-    # 📢 Broadcast help message
     if action == "adm_broadcast":
-        return bot.send_message(
-            call.message.chat.id,
-            "Use:\n/broadcast <your message>"
-        )
+        return bot.send_message(call.message.chat.id, "Use:\n/broadcast <your message>")
 
 # ---------------------------------------------------------
 # BROADCAST COMMAND
@@ -741,6 +910,33 @@ def detect_denom_near_code(full_text, code):
 # MAIN TEXT HANDLER (AUTO-DETECT CODES)
 # ---------------------------------------------------------
 
+@bot.message_handler(func=lambda m: m.content_type == "text" and m.from_user.id in pending_parse_review and pending_parse_review[m.from_user.id].get("editing") and not m.text.startswith("/"))
+def parse_edit_text_handler(message):
+    uid = message.from_user.id
+    pending = pending_parse_review.get(uid)
+    if not pending:
+        return
+
+    edited, err = parse_edited_lines(message.text)
+    if err:
+        return bot.send_message(message.chat.id, f"❌ {err}")
+
+    pending["entries"] = edited
+    pending["editing"] = False
+
+    kb = telebot.types.InlineKeyboardMarkup()
+    kb.add(
+        telebot.types.InlineKeyboardButton("✅ Confirm", callback_data="parse_confirm"),
+        telebot.types.InlineKeyboardButton("✏️ Edit", callback_data="parse_edit")
+    )
+    return bot.send_message(
+        message.chat.id,
+        render_parse_review_text(edited, title="🧾 *Updated parsed codes*"),
+        parse_mode="Markdown",
+        reply_markup=kb
+    )
+
+
 @bot.message_handler(func=lambda m: m.content_type == "text" and not m.text.startswith("/"))
 def auto_detect_text(message):
     uid = message.from_user.id
@@ -749,74 +945,99 @@ def auto_detect_text(message):
         return bot.send_message(message.chat.id, "❌ You are banned.")
 
     text = message.text.strip()
-    found_codes = detect_codes_in_text(text)
+    found_entries = parse_code_entries_from_text(text)
 
-    if not found_codes:
-        return  # No PSN code found in text
+    if not found_entries:
+        return
 
-    logger.info(f"[AUTO-DETECT] Found codes from user {uid}: {found_codes}")
+    logger.info(f"[AUTO-DETECT] Found codes from user {uid}: {[e['code'] for e in found_entries]}")
 
-    codes_with_denom = []        # list of tuples (code, denom)
-    codes_requiring_choice = []  # codes missing denom
-
-    for code in found_codes:
+    review_entries = []
+    dupes = []
+    for entry in found_entries:
+        code = entry["code"]
         norm = normalize_code(code)
-
         if norm in GLOBAL_CODES:
-            # Already saved globally → ignore
-            bot.send_message(
-                message.chat.id,
-                f"⚠ Already saved: `{to_display(code)}`",
-                parse_mode="Markdown"
-            )
+            dupes.append(code)
             continue
+        review_entries.append(entry)
 
-        # Try detecting amount near this code
-        denom = detect_denom_near_code(text, code)
-
-        if denom is not None:
-            # Save immediately
-            codes_with_denom.append((code, denom))
-        else:
-            # Needs user choice
-            codes_requiring_choice.append(code)
-
-    # ---------------------------------------------------------
-    # Save codes that already have denomination
-    # ---------------------------------------------------------
-
-    if codes_with_denom:
-        logger.info(f"[AUTO] Codes auto-detected with denom: {codes_with_denom}")
-
-        code_tuples = [(c, f"₹{d}", "N/A") for c, d in codes_with_denom]
-        store_user_codes(uid, code_tuples)
-
+    if dupes:
         bot.send_message(
             message.chat.id,
-            "✔ *Saved auto-detected codes:*\n\n" +
-            "\n".join(f"`{to_display(c)}` — ₹{d}" for c, d in codes_with_denom),
+            "⚠ Already saved (ignored):\n" + "\n".join(f"• `{to_display(c)}`" for c in dupes),
             parse_mode="Markdown"
         )
 
-    # ---------------------------------------------------------
-    # Codes requiring denomination selection
-    # ---------------------------------------------------------
+    if not review_entries:
+        return bot.send_message(message.chat.id, "⚠ No new unique codes found.")
 
-    if codes_requiring_choice:
-        pending_user_codes[uid] = codes_requiring_choice
+    pending_parse_review[uid] = {
+        "entries": review_entries,
+        "chat_id": message.chat.id,
+        "source_msg_id": message.message_id,
+    }
 
+    kb = telebot.types.InlineKeyboardMarkup()
+    kb.add(
+        telebot.types.InlineKeyboardButton("✅ Confirm", callback_data="parse_confirm"),
+        telebot.types.InlineKeyboardButton("✏️ Edit", callback_data="parse_edit")
+    )
+
+    bot.send_message(
+        message.chat.id,
+        render_parse_review_text(review_entries),
+        parse_mode="Markdown",
+        reply_markup=kb
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data in ["parse_confirm", "parse_edit"])
+def parse_review_handler(call):
+    uid = call.from_user.id
+    pending = pending_parse_review.get(uid)
+
+    if not pending:
+        return bot.answer_callback_query(call.id, "No pending parse review.")
+
+    if call.data == "parse_edit":
+        pending["editing"] = True
+        bot.answer_callback_query(call.id, "Send corrected lines now.")
+        return bot.send_message(
+            call.message.chat.id,
+            "✏️ Send corrected lines.\n"
+            "Format per line: `CODE 1k` or `CODE 1000`\n"
+            "Example:\n`8KEX-5KKJ-3H7B 3000`",
+            parse_mode="Markdown"
+        )
+
+    entries = pending["entries"]
+    unresolved = [e["code"] for e in entries if not e.get("denom")]
+    resolved = [(e["code"], e["denom"]) for e in entries if e.get("denom")]
+
+    if resolved:
+        store_user_codes(uid, [(c, f"₹{d}", "N/A") for c, d in resolved])
+
+    if unresolved:
+        pending_user_codes[uid] = unresolved
         kb = telebot.types.InlineKeyboardMarkup()
         for amt in ["₹1000", "₹2000", "₹3000", "₹4000", "₹5000"]:
             kb.add(telebot.types.InlineKeyboardButton(amt, callback_data=f"denom_{amt}"))
-
-        display = "\n".join(f"• `{to_display(c)}`" for c in codes_requiring_choice)
-
+        display = "\n".join(f"• `{to_display(c)}`" for c in unresolved)
         bot.send_message(
-            message.chat.id,
-            f"🎯 *These codes need denomination selection:*\n\n{display}\n\nChoose:",
+            call.message.chat.id,
+            f"🎯 *Need denomination for these codes:*\n\n{display}",
             parse_mode="Markdown",
             reply_markup=kb
         )
+
+    pending_parse_review.pop(uid, None)
+    return bot.edit_message_text(
+        f"✅ Saved {len(resolved)} parsed codes."
+        + (" Remaining codes need denomination selection." if unresolved else ""),
+        call.message.chat.id,
+        call.message.message_id
+    )
 
 
 # ---------------------------------------------------------
